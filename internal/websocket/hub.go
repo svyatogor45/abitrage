@@ -1,10 +1,16 @@
 package websocket
 
 import (
-	"encoding/json"
 	"log"
 	"sync"
+
+	// ОПТИМИЗАЦИЯ: jsoniter в 3-5x быстрее стандартного encoding/json
+	// При 1000+ сообщений/сек экономит ~2-5ms CPU в секунду
+	jsoniter "github.com/json-iterator/go"
 )
+
+// Быстрый JSON сериализатор (совместим со стандартным encoding/json API)
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 // Hub управляет всеми активными WebSocket соединениями
 //
@@ -49,10 +55,14 @@ type Hub struct {
 }
 
 // NewHub создает новый Hub
+//
+// ОПТИМИЗАЦИЯ: увеличен буфер broadcast до 4096
+// При 1000+ сообщений/сек буфер 256 заполнялся за 256ms
+// Теперь буфер на ~4 секунды - достаточно для пиковых нагрузок
 func NewHub() *Hub {
 	return &Hub{
 		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 256),
+		broadcast:  make(chan []byte, 4096), // было 256, стало 4096
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
 	}
