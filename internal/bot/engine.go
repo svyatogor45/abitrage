@@ -12,6 +12,32 @@ import (
 	"arbitrage/internal/models"
 )
 
+// ============ ОПТИМИЗАЦИЯ: Object Pool для PriceUpdate ============
+// Убирает ~1000+ аллокаций/сек в горячем пути
+
+var priceUpdatePool = sync.Pool{
+	New: func() interface{} {
+		return &PriceUpdate{}
+	},
+}
+
+// acquirePriceUpdate получает PriceUpdate из пула
+func acquirePriceUpdate() *PriceUpdate {
+	return priceUpdatePool.Get().(*PriceUpdate)
+}
+
+// releasePriceUpdate возвращает PriceUpdate в пул
+// ВАЖНО: вызывать только после полной обработки события!
+func releasePriceUpdate(p *PriceUpdate) {
+	// Очищаем строки для GC (опционально, но рекомендуется)
+	p.Exchange = ""
+	p.Symbol = ""
+	p.BidPrice = 0
+	p.AskPrice = 0
+	p.Timestamp = time.Time{}
+	priceUpdatePool.Put(p)
+}
+
 // Engine - главный движок арбитражного бота (EVENT-DRIVEN архитектура)
 //
 // ОПТИМИЗАЦИИ:
@@ -69,7 +95,7 @@ type Engine struct {
 
 // priceShard - шард для обработки ценовых событий
 type priceShard struct {
-	updates chan PriceUpdate
+	updates chan *PriceUpdate // указатели для использования с sync.Pool
 }
 
 // PairState - runtime состояние торговой пары
@@ -131,7 +157,7 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	// Инициализация шардов для worker pool
 	for i := 0; i < numShards; i++ {
 		e.priceShards[i] = &priceShard{
-			updates: make(chan PriceUpdate, 2000), // буфер на шард
+			updates: make(chan *PriceUpdate, 2000), // указатели + буфер на шард
 		}
 	}
 
@@ -168,28 +194,39 @@ func (e *Engine) priceEventWorker(ctx context.Context, shardIdx int) {
 			return
 		case update := <-shard.updates:
 			e.handlePriceUpdate(update)
+			// ОПТИМИЗАЦИЯ: возвращаем в пул после обработки
+			releasePriceUpdate(update)
 		}
 	}
 }
 
 // routePriceUpdate - роутинг события к нужному воркеру по символу
 // Детерминированный: один символ всегда попадает в один шард
-func (e *Engine) routePriceUpdate(update PriceUpdate) {
-	shardIdx := e.priceTracker.GetShardIndex(update.Symbol)
+// ОПТИМИЗАЦИЯ: получает объект из sync.Pool
+func (e *Engine) routePriceUpdate(exchName, symbol string, bidPrice, askPrice float64, timestamp time.Time) {
+	shardIdx := e.priceTracker.GetShardIndex(symbol)
+
+	// Получаем объект из пула (без аллокации!)
+	update := acquirePriceUpdate()
+	update.Exchange = exchName
+	update.Symbol = symbol
+	update.BidPrice = bidPrice
+	update.AskPrice = askPrice
+	update.Timestamp = timestamp
 
 	select {
 	case e.priceShards[shardIdx].updates <- update:
 	default:
-		// Буфер полон - пропускаем (не блокируем WS)
-		// В production можно добавить метрику dropped events
+		// Буфер полон - возвращаем в пул и пропускаем
+		releasePriceUpdate(update)
 	}
 }
 
 // handlePriceUpdate - обработка обновления цены
 // Время выполнения: ~0.5-2ms (без сетевых запросов!)
-func (e *Engine) handlePriceUpdate(update PriceUpdate) {
+func (e *Engine) handlePriceUpdate(update *PriceUpdate) {
 	// 1. Обновляем шардированный трекер цен O(k), k=число бирж
-	e.priceTracker.Update(update)
+	e.priceTracker.UpdateFromPtr(update)
 
 	// 2. Получаем пары для этого символа O(1) через индекс
 	pairs := e.getPairsForSymbol(update.Symbol)
@@ -481,14 +518,14 @@ func (e *Engine) subscribeToSymbol(symbol string) {
 	for name, exch := range e.exchanges {
 		exchName := name // захват для closure
 		exch.SubscribeTicker(symbol, func(ticker *exchange.Ticker) {
-			// Роутинг через шардированный канал
-			e.routePriceUpdate(PriceUpdate{
-				Exchange:  exchName,
-				Symbol:    ticker.Symbol,
-				BidPrice:  ticker.BidPrice,
-				AskPrice:  ticker.AskPrice,
-				Timestamp: ticker.Timestamp,
-			})
+			// Роутинг через шардированный канал (без аллокации!)
+			e.routePriceUpdate(
+				exchName,
+				ticker.Symbol,
+				ticker.BidPrice,
+				ticker.AskPrice,
+				ticker.Timestamp,
+			)
 		})
 	}
 }
@@ -522,9 +559,9 @@ func (e *Engine) PausePair(pairID int) error {
 }
 
 // OnPriceUpdate - публичный метод для приема ценовых обновлений
-// DEPRECATED: используйте routePriceUpdate внутри subscribeToSymbol
-func (e *Engine) OnPriceUpdate(update PriceUpdate) {
-	e.routePriceUpdate(update)
+// Использует sync.Pool для zero-allocation
+func (e *Engine) OnPriceUpdate(exchange, symbol string, bidPrice, askPrice float64, timestamp time.Time) {
+	e.routePriceUpdate(exchange, symbol, bidPrice, askPrice, timestamp)
 }
 
 // GetActiveArbitrages возвращает текущее количество активных арбитражей

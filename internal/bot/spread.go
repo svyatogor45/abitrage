@@ -142,6 +142,37 @@ func (pt *PriceTracker) Update(update PriceUpdate) {
 	shard.recalculateBest(update.Symbol)
 }
 
+// UpdateFromPtr обновляет цену от указателя (для использования с sync.Pool)
+// Сложность: O(k) где k = количество бирж для символа (обычно 6)
+func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
+	shard := pt.getShard(update.Symbol)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	key := PriceKey{
+		Symbol:   update.Symbol,
+		Exchange: update.Exchange,
+	}
+
+	// Добавляем в индекс если это новая биржа для символа
+	if _, exists := shard.allPrices[key]; !exists {
+		shard.symbolIndex[update.Symbol] = append(shard.symbolIndex[update.Symbol], key)
+	}
+
+	// Сохраняем цену этой биржи
+	shard.allPrices[key] = &ExchangePrice{
+		Exchange:  update.Exchange,
+		Symbol:    update.Symbol,
+		BidPrice:  update.BidPrice,
+		AskPrice:  update.AskPrice,
+		Timestamp: update.Timestamp,
+	}
+
+	// Пересчитываем лучшие цены для этого символа
+	shard.recalculateBest(update.Symbol)
+}
+
 // recalculateBest пересчитывает лучшие Ask и Bid для символа
 // Сложность: O(k) где k = количество бирж для этого символа
 // ВАЖНО: вызывается под lock'ом шарда
