@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  # PostgreSQL база данных
+  db:
+    image: postgres:15-alpine
+    container_name: arbitrage-db
+    environment:
+      POSTGRES_DB: arbitrage
+      POSTGRES_USER: arbitrage_user
+      POSTGRES_PASSWORD: arbitrage_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - arbitrage-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arbitrage_user -d arbitrage"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend приложение (Go)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arbitrage-app
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Server
+      SERVER_PORT: 8080
+      SERVER_HOST: 0.0.0.0
+      USE_HTTPS: "false"
+
+      # Database
+      DB_DRIVER: postgres
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: arbitrage
+      DB_USER: arbitrage_user
+      DB_PASSWORD: arbitrage_password
+      DB_SSL_MODE: disable
+
+      # Security (ВАЖНО: изменить в production!)
+      JWT_SECRET: change-me-in-production-very-long-secret-key
+      ENCRYPTION_KEY: 12345678901234567890123456789012  # 32 байта для AES-256
+
+      # Bot
+      UPDATE_INTERVAL: 1s
+      BALANCE_UPDATE_FREQ: 1m
+      MAX_RETRIES: 4
+      RETRY_BACKOFF: 2s
+
+      # Logging
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+    ports:
+      - "8080:8080"
+    networks:
+      - arbitrage-network
+    restart: unless-stopped
+    volumes:
+      - ./logs:/root/logs
+
+  # Frontend (React) - для development
+  # В production лучше использовать nginx для статики
+  frontend:
+    image: node:18-alpine
+    container_name: arbitrage-frontend
+    working_dir: /app
+    command: sh -c "npm install && npm start"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8080
+      - REACT_APP_WS_URL=ws://localhost:8080/ws/stream
+    networks:
+      - arbitrage-network
+    depends_on:
+      - app
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  arbitrage-network:
+    driver: bridge
