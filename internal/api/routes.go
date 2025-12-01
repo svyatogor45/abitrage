@@ -82,8 +82,12 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		exchangeHandler = handlers.NewExchangeHandler(deps.ExchangeService)
 	}
 
+	var pairHandler *handlers.PairHandler
+	if deps != nil && deps.PairService != nil {
+		pairHandler = handlers.NewPairHandler(deps.PairService)
+	}
+
 	// TODO: аналогично для других handlers когда будут реализованы сервисы
-	pairHandler := handlers.NewPairHandler()
 	notificationHandler := handlers.NewNotificationHandler()
 	statsHandler := handlers.NewStatsHandler()
 	blacklistHandler := handlers.NewBlacklistHandler()
@@ -105,13 +109,15 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	}
 
 	// Pair routes
-	api.HandleFunc("/pairs", pairHandler.GetPairs).Methods("GET")
-	api.HandleFunc("/pairs", pairHandler.CreatePair).Methods("POST")
-	api.HandleFunc("/pairs/{id}", pairHandler.GetPair).Methods("GET")
-	api.HandleFunc("/pairs/{id}", pairHandler.UpdatePair).Methods("PATCH")
-	api.HandleFunc("/pairs/{id}", pairHandler.DeletePair).Methods("DELETE")
-	api.HandleFunc("/pairs/{id}/start", pairHandler.StartPair).Methods("POST")
-	api.HandleFunc("/pairs/{id}/pause", pairHandler.PausePair).Methods("POST")
+	if pairHandler != nil {
+		api.HandleFunc("/pairs", pairHandler.GetPairs).Methods("GET")
+		api.HandleFunc("/pairs", pairHandler.CreatePair).Methods("POST")
+		api.HandleFunc("/pairs/{id}", pairHandler.GetPair).Methods("GET")
+		api.HandleFunc("/pairs/{id}", pairHandler.UpdatePair).Methods("PATCH")
+		api.HandleFunc("/pairs/{id}", pairHandler.DeletePair).Methods("DELETE")
+		api.HandleFunc("/pairs/{id}/start", pairHandler.StartPair).Methods("POST")
+		api.HandleFunc("/pairs/{id}/pause", pairHandler.PausePair).Methods("POST")
+	}
 
 	// Notification routes
 	api.HandleFunc("/notifications", notificationHandler.GetNotifications).Methods("GET")

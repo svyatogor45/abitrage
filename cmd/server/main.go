@@ -50,8 +50,14 @@ func main() {
 		cfg.Security.EncryptionKey,
 	)
 
+	// Инициализация PairService
+	pairService := service.NewPairService(
+		pairRepo,
+		exchangeRepo,
+		exchangeService,
+	)
+
 	// TODO: инициализировать другие сервисы когда они будут реализованы
-	// pairService := service.NewPairService(...)
 	// notificationService := service.NewNotificationService(...)
 	// statsService := service.NewStatsService(...)
 
@@ -66,7 +72,7 @@ func main() {
 	// Настройка зависимостей для API
 	deps := &api.Dependencies{
 		ExchangeService: exchangeService,
-		// PairService:         pairService,
+		PairService:     pairService,
 		// NotificationService: notificationService,
 		// StatsService:        statsService,
 	}

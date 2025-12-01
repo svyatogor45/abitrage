@@ -34,12 +34,6 @@ type BalanceResponse struct {
 	Currency string  `json:"currency"`
 }
 
-// ErrorResponse - ответ с ошибкой
-type ErrorResponse struct {
-	Error   string `json:"error"`
-	Details string `json:"details,omitempty"`
-}
-
 // ExchangeHandler отвечает за управление биржевыми аккаунтами
 //
 // Endpoints:
