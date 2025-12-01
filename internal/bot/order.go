@@ -67,6 +67,15 @@ type ExecuteResult struct {
 	// Детали исполнения
 	LongOrder  *exchange.Order
 	ShortOrder *exchange.Order
+
+	// PNL при закрытии позиции
+	TotalPnl float64
+}
+
+// CloseParams - параметры для закрытия позиции
+type CloseParams struct {
+	Symbol string
+	Legs   []models.Leg
 }
 
 // LegResult - результат одной ноги
@@ -241,7 +250,10 @@ func (oe *OrderExecutor) rollbackShort(symbol string, exch exchange.Exchange, or
 // CloseParallel закрывает обе позиции параллельно
 //
 // ОПТИМИЗАЦИЯ: использует sync.Pool для каналов - без аллокаций на каждый ордер
-func (oe *OrderExecutor) CloseParallel(ctx context.Context, legs []models.Leg, symbol string) *ExecuteResult {
+func (oe *OrderExecutor) CloseParallel(ctx context.Context, params CloseParams) *ExecuteResult {
+	legs := params.Legs
+	symbol := params.Symbol
+
 	if len(legs) != 2 {
 		return &ExecuteResult{Success: false, Error: fmt.Errorf("expected 2 legs, got %d", len(legs))}
 	}
@@ -307,10 +319,33 @@ func (oe *OrderExecutor) CloseParallel(ctx context.Context, legs []models.Leg, s
 		}
 	}
 
+	// Рассчитываем PNL для каждой ноги
+	var totalPnl float64
+	for i, leg := range legs {
+		var result LegResult
+		if i == 0 {
+			result = res1
+		} else {
+			result = res2
+		}
+
+		if result.Order != nil {
+			closePrice := result.Order.AvgFillPrice
+			if leg.Side == "long" {
+				// Long: PNL = (цена закрытия - цена входа) * количество
+				totalPnl += (closePrice - leg.EntryPrice) * leg.Quantity
+			} else {
+				// Short: PNL = (цена входа - цена закрытия) * количество
+				totalPnl += (leg.EntryPrice - closePrice) * leg.Quantity
+			}
+		}
+	}
+
 	return &ExecuteResult{
 		Success:    true,
 		LongOrder:  res1.Order,
 		ShortOrder: res2.Order,
+		TotalPnl:   totalPnl,
 	}
 }
 
