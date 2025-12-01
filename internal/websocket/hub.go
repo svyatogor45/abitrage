@@ -1,0 +1,155 @@
+package websocket
+
+import (
+	"encoding/json"
+	"log"
+	"sync"
+)
+
+// Hub управляет всеми активными WebSocket соединениями
+//
+// Назначение:
+// Центральный менеджер для broadcast сообщений всем подключенным клиентам.
+// Обеспечивает real-time обновления данных на frontend без необходимости polling.
+//
+// Функции:
+// - Регистрация новых WebSocket клиентов
+// - Отмена регистрации отключенных клиентов
+// - Broadcast сообщений всем активным клиентам
+// - Маршрутизация сообщений по типам (pairUpdate, notification, balanceUpdate)
+// - Обработка переподключений
+// - Очистка отключенных соединений
+// - Потокобезопасная работа с клиентами (sync.RWMutex)
+//
+// Типы сообщений:
+// - pairUpdate: обновление состояния пары (цены, PNL, спред)
+// - notification: новое уведомление
+// - balanceUpdate: обновление баланса биржи
+// - statsUpdate: обновление статистики
+//
+// Использование:
+// 1. Создать hub: hub := NewHub()
+// 2. Запустить в горутине: go hub.Run()
+// 3. Отправлять сообщения: hub.Broadcast(message)
+type Hub struct {
+	// Зарегистрированные клиенты
+	clients map[*Client]bool
+
+	// Broadcast канал для отправки сообщений всем клиентам
+	broadcast chan []byte
+
+	// Регистрация нового клиента
+	register chan *Client
+
+	// Отмена регистрации клиента
+	unregister chan *Client
+
+	// Mutex для потокобезопасного доступа к clients
+	mu sync.RWMutex
+}
+
+// NewHub создает новый Hub
+func NewHub() *Hub {
+	return &Hub{
+		clients:    make(map[*Client]bool),
+		broadcast:  make(chan []byte, 256),
+		register:   make(chan *Client),
+		unregister: make(chan *Client),
+	}
+}
+
+// Run запускает главный цикл Hub
+//
+// Должен запускаться в отдельной горутине: go hub.Run()
+// Обрабатывает регистрацию, отмену регистрации и broadcast
+func (h *Hub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
+			log.Printf("Client connected. Total clients: %d", len(h.clients))
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+			}
+			h.mu.Unlock()
+			log.Printf("Client disconnected. Total clients: %d", len(h.clients))
+
+		case message := <-h.broadcast:
+			h.mu.RLock()
+			for client := range h.clients {
+				select {
+				case client.send <- message:
+					// Сообщение отправлено успешно
+				default:
+					// Клиент не успевает обрабатывать сообщения
+					// Закрываем соединение
+					close(client.send)
+					delete(h.clients, client)
+				}
+			}
+			h.mu.RUnlock()
+		}
+	}
+}
+
+// Broadcast отправляет сообщение всем подключенным клиентам
+func (h *Hub) Broadcast(message interface{}) {
+	data, err := json.Marshal(message)
+	if err != nil {
+		log.Printf("Error marshaling broadcast message: %v", err)
+		return
+	}
+
+	h.broadcast <- data
+}
+
+// BroadcastPairUpdate отправляет обновление состояния пары
+func (h *Hub) BroadcastPairUpdate(pairID int, data interface{}) {
+	message := map[string]interface{}{
+		"type":    "pairUpdate",
+		"pair_id": pairID,
+		"data":    data,
+	}
+	h.Broadcast(message)
+}
+
+// BroadcastNotification отправляет новое уведомление
+func (h *Hub) BroadcastNotification(notification interface{}) {
+	message := map[string]interface{}{
+		"type": "notification",
+		"data": notification,
+	}
+	h.Broadcast(message)
+}
+
+// BroadcastBalanceUpdate отправляет обновление баланса биржи
+func (h *Hub) BroadcastBalanceUpdate(exchange string, balance float64) {
+	message := map[string]interface{}{
+		"type":     "balanceUpdate",
+		"exchange": exchange,
+		"balance":  balance,
+	}
+	h.Broadcast(message)
+}
+
+// BroadcastStatsUpdate отправляет обновление статистики
+func (h *Hub) BroadcastStatsUpdate(stats interface{}) {
+	message := map[string]interface{}{
+		"type": "statsUpdate",
+		"data": stats,
+	}
+	h.Broadcast(message)
+}
+
+// ClientCount возвращает количество подключенных клиентов
+func (h *Hub) ClientCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
+}
