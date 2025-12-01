@@ -38,8 +38,8 @@ func main() {
 	// Инициализация репозиториев
 	exchangeRepo := repository.NewExchangeRepository(db)
 	pairRepo := repository.NewPairRepository(db)
+	statsRepo := repository.NewStatsRepository(db)
 	// notificationRepo := repository.NewNotificationRepository(db)
-	// statsRepo := repository.NewStatsRepository(db)
 	// blacklistRepo := repository.NewBlacklistRepository(db)
 	// settingsRepo := repository.NewSettingsRepository(db)
 
@@ -57,9 +57,14 @@ func main() {
 		exchangeService,
 	)
 
+	// Инициализация StatsService
+	statsService := service.NewStatsService(
+		statsRepo,
+		pairRepo,
+	)
+
 	// TODO: инициализировать другие сервисы когда они будут реализованы
 	// notificationService := service.NewNotificationService(...)
-	// statsService := service.NewStatsService(...)
 
 	// TODO: Инициализация WebSocket hub
 	// hub := websocket.NewHub()
@@ -73,8 +78,8 @@ func main() {
 	deps := &api.Dependencies{
 		ExchangeService: exchangeService,
 		PairService:     pairService,
+		StatsService:    statsService,
 		// NotificationService: notificationService,
-		// StatsService:        statsService,
 	}
 
 	// Настройка HTTP роутера
