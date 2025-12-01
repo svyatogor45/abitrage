@@ -299,6 +299,9 @@ func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 }
 
 // shouldEnter - проверка всех условий для входа
+//
+// ВАЖНО: Эта функция вызывается в горячем пути (1000+ раз/сек).
+// НЕ делать здесь синхронных сетевых запросов!
 func (e *Engine) shouldEnter(ps *PairState, opp *ArbitrageOpportunity) bool {
 	// 1. Спред достаточный?
 	if opp.NetSpread < ps.Config.EntrySpreadPct {
@@ -306,10 +309,35 @@ func (e *Engine) shouldEnter(ps *PairState, opp *ArbitrageOpportunity) bool {
 	}
 
 	// 2. Маржа достаточна на обеих биржах?
-	// TODO: проверка маржи (кэшируется, не делаем сетевой запрос)
+	// TODO: проверка маржи
+	//
+	// РЕКОМЕНДАЦИИ ПО РЕАЛИЗАЦИИ:
+	// - Балансы уже обновляются каждую минуту в updateBalances() - использовать их
+	// - Добавить поле cachedBalances map[string]float64 в Engine
+	// - Проверять: cachedBalances[opp.LongExchange] >= requiredMargin
+	// - НЕ делать сетевых запросов здесь!
+	//
+	// Пример:
+	// requiredMargin := ps.Config.VolumeAsset * opp.LongPrice / ps.Config.Leverage
+	// if e.cachedBalances[opp.LongExchange] < requiredMargin {
+	//     return false
+	// }
 
 	// 3. Лимиты ордеров соблюдены?
-	// TODO: проверка min/max qty (кэшируется)
+	// TODO: проверка min/max qty
+	//
+	// РЕКОМЕНДАЦИИ ПО РЕАЛИЗАЦИИ:
+	// - Кэшировать лимиты символов при старте (TTL 1 час)
+	// - Добавить структуру SymbolLimits{MinQty, MaxQty, StepSize, MinNotional}
+	// - Загружать через exchange.GetSymbolInfo() при AddPair()
+	// - Хранить в map[string]SymbolLimits (ключ: "exchange:symbol")
+	// - НЕ делать сетевых запросов здесь!
+	//
+	// Пример:
+	// limits := e.symbolLimits[opp.LongExchange + ":" + ps.Config.Symbol]
+	// if ps.Config.VolumeAsset < limits.MinQty || ps.Config.VolumeAsset > limits.MaxQty {
+	//     return false
+	// }
 
 	return true
 }
