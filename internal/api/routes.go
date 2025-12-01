@@ -12,12 +12,11 @@ import (
 
 // Dependencies содержит все зависимости для API handlers
 type Dependencies struct {
-	ExchangeService *service.ExchangeService
-	PairService     *service.PairService
-	StatsService    *service.StatsService
-	SettingsService *service.SettingsService
-	// TODO: добавить сервисы когда они будут реализованы
-	// NotificationService *service.NotificationService
+	ExchangeService     *service.ExchangeService
+	PairService         *service.PairService
+	StatsService        *service.StatsService
+	SettingsService     *service.SettingsService
+	NotificationService *service.NotificationService
 }
 
 // SetupRoutes настраивает все HTTP маршруты приложения
@@ -100,8 +99,13 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		settingsHandler = handlers.NewSettingsHandler(deps.SettingsService)
 	}
 
-	// TODO: аналогично для других handlers когда будут реализованы сервисы
-	notificationHandler := handlers.NewNotificationHandler()
+	// Notification handler с внедрением зависимости
+	var notificationHandler *handlers.NotificationHandler
+	if deps != nil && deps.NotificationService != nil {
+		notificationHandler = handlers.NewNotificationHandler(deps.NotificationService)
+	}
+
+	// TODO: BlacklistService не реализован
 	blacklistHandler := handlers.NewBlacklistHandler()
 
 	// API v1 routes
@@ -131,8 +135,10 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	}
 
 	// Notification routes
-	api.HandleFunc("/notifications", notificationHandler.GetNotifications).Methods("GET")
-	api.HandleFunc("/notifications", notificationHandler.ClearNotifications).Methods("DELETE")
+	if notificationHandler != nil {
+		api.HandleFunc("/notifications", notificationHandler.GetNotifications).Methods("GET")
+		api.HandleFunc("/notifications", notificationHandler.ClearNotifications).Methods("DELETE")
+	}
 
 	// Stats routes
 	if statsHandler != nil {
