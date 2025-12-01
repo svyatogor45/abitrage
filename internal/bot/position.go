@@ -173,13 +173,9 @@ func (pm *PositionManager) checkExitConditions(ps *PairState, status *PositionSt
 // checkStopLoss проверяет достижение Stop Loss
 func (pm *PositionManager) checkStopLoss(ps *PairState, totalPnl float64) bool {
 	// Stop Loss срабатывает когда PNL падает ниже -StopLoss
-	if ps.Config.StopLossPct > 0 {
-		// Конвертируем процент в абсолютное значение
-		// StopLoss в процентах от объёма позиции
-		positionValue := ps.Config.VolumeAsset * getAverageEntryPrice(ps)
-		stopLossValue := positionValue * ps.Config.StopLossPct / 100
-
-		if totalPnl <= -stopLossValue {
+	// StopLoss задается в абсолютном значении USDT
+	if ps.Config.StopLoss > 0 {
+		if totalPnl <= -ps.Config.StopLoss {
 			atomic.AddInt64(&pm.stopLossHits, 1)
 			return true
 		}
