@@ -62,6 +62,9 @@ func NewHub() *Hub {
 //
 // Должен запускаться в отдельной горутине: go hub.Run()
 // Обрабатывает регистрацию, отмену регистрации и broadcast
+//
+// ОПТИМИЗАЦИЯ: исправлен race condition при удалении клиентов под RLock
+// Теперь: копируем список → отправляем без Lock → удаляем под Write Lock
 func (h *Hub) Run() {
 	for {
 		select {
@@ -81,19 +84,38 @@ func (h *Hub) Run() {
 			log.Printf("Client disconnected. Total clients: %d", len(h.clients))
 
 		case message := <-h.broadcast:
+			// ОПТИМИЗАЦИЯ: копируем список клиентов под коротким RLock
 			h.mu.RLock()
+			clients := make([]*Client, 0, len(h.clients))
 			for client := range h.clients {
+				clients = append(clients, client)
+			}
+			h.mu.RUnlock()
+
+			// Отправляем сообщения БЕЗ блокировки (не блокируем register/unregister)
+			var toRemove []*Client
+			for _, client := range clients {
 				select {
 				case client.send <- message:
 					// Сообщение отправлено успешно
 				default:
-					// Клиент не успевает обрабатывать сообщения
-					// Закрываем соединение
-					close(client.send)
-					delete(h.clients, client)
+					// Клиент не успевает обрабатывать сообщения - помечаем для удаления
+					toRemove = append(toRemove, client)
 				}
 			}
-			h.mu.RUnlock()
+
+			// Удаляем медленных клиентов под Write Lock
+			if len(toRemove) > 0 {
+				h.mu.Lock()
+				for _, client := range toRemove {
+					if _, ok := h.clients[client]; ok {
+						delete(h.clients, client)
+						close(client.send)
+					}
+				}
+				h.mu.Unlock()
+				log.Printf("Removed %d slow clients. Total clients: %d", len(toRemove), len(h.clients))
+			}
 		}
 	}
 }

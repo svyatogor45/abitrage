@@ -99,21 +99,28 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 		shortCh <- LegResult{Order: order, Error: err}
 	}()
 
-	// Ожидание обоих результатов
+	// ОПТИМИЗАЦИЯ: параллельное ожидание обоих результатов
+	// Было: ждём long → потом ждём short (если long медленный, не слушаем short)
+	// Стало: слушаем оба канала одновременно
 	var longResult, shortResult LegResult
+	var longReceived, shortReceived bool
 
-	select {
-	case longResult = <-longCh:
-	case <-ctx.Done():
-		return &ExecuteResult{Success: false, Error: ctx.Err()}
-	}
-
-	select {
-	case shortResult = <-shortCh:
-	case <-ctx.Done():
-		// Лонг уже открыт, но контекст отменён - нужно закрыть лонг!
-		oe.rollbackLong(params.Symbol, longExch, longResult.Order)
-		return &ExecuteResult{Success: false, Error: ctx.Err()}
+	for !longReceived || !shortReceived {
+		select {
+		case longResult = <-longCh:
+			longReceived = true
+		case shortResult = <-shortCh:
+			shortReceived = true
+		case <-ctx.Done():
+			// Timeout - откатываем то, что успело исполниться
+			if longReceived && longResult.Error == nil {
+				oe.rollbackLong(params.Symbol, longExch, longResult.Order)
+			}
+			if shortReceived && shortResult.Error == nil {
+				oe.rollbackShort(params.Symbol, shortExch, shortResult.Order)
+			}
+			return &ExecuteResult{Success: false, Error: ctx.Err()}
+		}
 	}
 
 	// Обработка результатов
@@ -244,19 +251,19 @@ func (oe *OrderExecutor) CloseParallel(ctx context.Context, legs []models.Leg, s
 		ch2 <- LegResult{Order: order, Error: err}
 	}()
 
-	// Ожидание результатов
+	// ОПТИМИЗАЦИЯ: параллельное ожидание обоих результатов
 	var res1, res2 LegResult
+	var res1Received, res2Received bool
 
-	select {
-	case res1 = <-ch1:
-	case <-ctx.Done():
-		return &ExecuteResult{Success: false, Error: ctx.Err()}
-	}
-
-	select {
-	case res2 = <-ch2:
-	case <-ctx.Done():
-		return &ExecuteResult{Success: false, Error: ctx.Err()}
+	for !res1Received || !res2Received {
+		select {
+		case res1 = <-ch1:
+			res1Received = true
+		case res2 = <-ch2:
+			res2Received = true
+		case <-ctx.Done():
+			return &ExecuteResult{Success: false, Error: ctx.Err()}
+		}
 	}
 
 	// Проверяем результаты
