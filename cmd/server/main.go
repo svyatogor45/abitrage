@@ -40,7 +40,7 @@ func main() {
 	pairRepo := repository.NewPairRepository(db)
 	statsRepo := repository.NewStatsRepository(db)
 	settingsRepo := repository.NewSettingsRepository(db)
-	// notificationRepo := repository.NewNotificationRepository(db)
+	notificationRepo := repository.NewNotificationRepository(db)
 	// blacklistRepo := repository.NewBlacklistRepository(db)
 
 	// Инициализация сервисов
@@ -66,8 +66,11 @@ func main() {
 	// Инициализация SettingsService
 	settingsService := service.NewSettingsService(settingsRepo)
 
-	// TODO: инициализировать другие сервисы когда они будут реализованы
-	// notificationService := service.NewNotificationService(...)
+	// Инициализация NotificationService
+	notificationService := service.NewNotificationService(
+		notificationRepo,
+		settingsRepo,
+	)
 
 	// TODO: Инициализация WebSocket hub
 	// hub := websocket.NewHub()
@@ -79,11 +82,11 @@ func main() {
 
 	// Настройка зависимостей для API
 	deps := &api.Dependencies{
-		ExchangeService: exchangeService,
-		PairService:     pairService,
-		StatsService:    statsService,
-		SettingsService: settingsService,
-		// NotificationService: notificationService,
+		ExchangeService:     exchangeService,
+		PairService:         pairService,
+		StatsService:        statsService,
+		SettingsService:     settingsService,
+		NotificationService: notificationService,
 	}
 
 	// Настройка HTTP роутера
