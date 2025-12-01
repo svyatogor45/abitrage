@@ -45,10 +45,22 @@ type SecurityConfig struct {
 
 // BotConfig - настройки бота
 type BotConfig struct {
-	UpdateInterval    time.Duration
-	BalanceUpdateFreq time.Duration
-	MaxRetries        int
-	RetryBackoff      time.Duration
+	// WebSocket настройки (event-driven, без polling)
+	WSReconnectDelay  time.Duration // задержка перед переподключением WS
+	WSPingInterval    time.Duration // интервал ping для поддержания соединения
+	WSReadTimeout     time.Duration // таймаут чтения WS сообщений
+
+	// Периодические задачи (не влияют на торговлю)
+	BalanceUpdateFreq time.Duration // обновление балансов для UI
+	StatsUpdateFreq   time.Duration // обновление статистики для UI
+
+	// Retry логика для критических операций
+	MaxRetries      int
+	RetryBackoff    time.Duration
+	OrderTimeout    time.Duration // таймаут ожидания исполнения ордера
+
+	// Торговые параметры
+	MaxConcurrentArbs int // максимум одновременных арбитражей (0 = без лимита)
 }
 
 // LoggingConfig - настройки логирования
@@ -82,10 +94,22 @@ func Load() (*Config, error) {
 			SessionTimeout: getEnvAsInt("SESSION_TIMEOUT", 3600),
 		},
 		Bot: BotConfig{
-			UpdateInterval:    getEnvAsDuration("UPDATE_INTERVAL", 1*time.Second),
+			// WebSocket - event-driven, без polling!
+			WSReconnectDelay:  getEnvAsDuration("WS_RECONNECT_DELAY", 1*time.Second),
+			WSPingInterval:    getEnvAsDuration("WS_PING_INTERVAL", 15*time.Second),
+			WSReadTimeout:     getEnvAsDuration("WS_READ_TIMEOUT", 30*time.Second),
+
+			// Периодические задачи для UI (не критичны для торговли)
 			BalanceUpdateFreq: getEnvAsDuration("BALANCE_UPDATE_FREQ", 1*time.Minute),
-			MaxRetries:        getEnvAsInt("MAX_RETRIES", 4),
-			RetryBackoff:      getEnvAsDuration("RETRY_BACKOFF", 2*time.Second),
+			StatsUpdateFreq:   getEnvAsDuration("STATS_UPDATE_FREQ", 5*time.Second),
+
+			// Retry для ордеров
+			MaxRetries:   getEnvAsInt("MAX_RETRIES", 4),
+			RetryBackoff: getEnvAsDuration("RETRY_BACKOFF", 500*time.Millisecond),
+			OrderTimeout: getEnvAsDuration("ORDER_TIMEOUT", 5*time.Second),
+
+			// Торговые лимиты
+			MaxConcurrentArbs: getEnvAsInt("MAX_CONCURRENT_ARBS", 0), // 0 = без лимита
 		},
 		Logging: LoggingConfig{
 			Level:  getEnv("LOG_LEVEL", "info"),
