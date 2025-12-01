@@ -41,7 +41,7 @@ func main() {
 	statsRepo := repository.NewStatsRepository(db)
 	settingsRepo := repository.NewSettingsRepository(db)
 	notificationRepo := repository.NewNotificationRepository(db)
-	// blacklistRepo := repository.NewBlacklistRepository(db)
+	blacklistRepo := repository.NewBlacklistRepository(db)
 
 	// Инициализация сервисов
 	exchangeService := service.NewExchangeService(
@@ -72,6 +72,9 @@ func main() {
 		settingsRepo,
 	)
 
+	// Инициализация BlacklistService
+	blacklistService := service.NewBlacklistService(blacklistRepo)
+
 	// TODO: Инициализация WebSocket hub
 	// hub := websocket.NewHub()
 	// go hub.Run()
@@ -87,6 +90,7 @@ func main() {
 		StatsService:        statsService,
 		SettingsService:     settingsService,
 		NotificationService: notificationService,
+		BlacklistService:    blacklistService,
 	}
 
 	// Настройка HTTP роутера

@@ -17,6 +17,7 @@ type Dependencies struct {
 	StatsService        *service.StatsService
 	SettingsService     *service.SettingsService
 	NotificationService *service.NotificationService
+	BlacklistService    *service.BlacklistService
 }
 
 // SetupRoutes настраивает все HTTP маршруты приложения
@@ -105,8 +106,11 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		notificationHandler = handlers.NewNotificationHandler(deps.NotificationService)
 	}
 
-	// TODO: BlacklistService не реализован
-	blacklistHandler := handlers.NewBlacklistHandler()
+	// Blacklist handler с внедрением зависимости
+	var blacklistHandler *handlers.BlacklistHandler
+	if deps != nil && deps.BlacklistService != nil {
+		blacklistHandler = handlers.NewBlacklistHandler(deps.BlacklistService)
+	}
 
 	// API v1 routes
 	api := router.PathPrefix("/api/v1").Subrouter()
@@ -148,9 +152,11 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	}
 
 	// Blacklist routes
-	api.HandleFunc("/blacklist", blacklistHandler.GetBlacklist).Methods("GET")
-	api.HandleFunc("/blacklist", blacklistHandler.AddToBlacklist).Methods("POST")
-	api.HandleFunc("/blacklist/{symbol}", blacklistHandler.RemoveFromBlacklist).Methods("DELETE")
+	if blacklistHandler != nil {
+		api.HandleFunc("/blacklist", blacklistHandler.GetBlacklist).Methods("GET")
+		api.HandleFunc("/blacklist", blacklistHandler.AddToBlacklist).Methods("POST")
+		api.HandleFunc("/blacklist/{symbol}", blacklistHandler.RemoveFromBlacklist).Methods("DELETE")
+	}
 
 	// Settings routes
 	if settingsHandler != nil {
