@@ -1,6 +1,8 @@
 package api
 
 import (
+	"net/http"
+
 	"arbitrage/internal/api/handlers"
 	"arbitrage/internal/api/middleware"
 
