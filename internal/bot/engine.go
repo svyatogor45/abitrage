@@ -684,3 +684,125 @@ func (e *Engine) GetActiveArbitrages() int64 {
 func (e *Engine) GetNumShards() int {
 	return e.numShards
 }
+
+// ============ API для PairService ============
+
+// GetPairRuntime возвращает runtime состояние пары
+func (e *Engine) GetPairRuntime(pairID int) *models.PairRuntime {
+	e.pairsMu.RLock()
+	ps, ok := e.pairs[pairID]
+	e.pairsMu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	// Возвращаем копию для безопасности
+	if ps.Runtime == nil {
+		return nil
+	}
+
+	runtime := *ps.Runtime
+	return &runtime
+}
+
+// ForceClosePair принудительно закрывает позиции пары
+func (e *Engine) ForceClosePair(ctx context.Context, pairID int) error {
+	e.pairsMu.RLock()
+	ps, ok := e.pairs[pairID]
+	e.pairsMu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Проверяем, есть ли открытая позиция
+	if ps.Runtime.State != models.StateHolding {
+		return nil // Нет позиции для закрытия
+	}
+
+	// Переводим в состояние закрытия
+	ps.Runtime.State = models.StateExiting
+
+	// Выполняем закрытие позиций асинхронно
+	go func() {
+		e.executeForceClose(ps)
+	}()
+
+	return nil
+}
+
+// executeForceClose выполняет принудительное закрытие позиций
+func (e *Engine) executeForceClose(ps *PairState) {
+	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
+	defer cancel()
+
+	// Закрываем обе ноги параллельно
+	result := e.orderExec.CloseParallel(ctx, CloseParams{
+		Symbol: ps.Config.Symbol,
+		Legs:   ps.Runtime.Legs,
+	})
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if result.Success {
+		// Сохраняем PNL и очищаем позицию
+		ps.Runtime.RealizedPnl += result.TotalPnl
+		ps.Runtime.Legs = nil
+		ps.Runtime.State = models.StatePaused
+		ps.Runtime.FilledParts = 0
+		e.decrementActiveArbs()
+	} else {
+		// Ошибка закрытия - переводим в ERROR
+		ps.Runtime.State = models.StateError
+		e.notifyError(ps, result.Error)
+	}
+}
+
+// UpdatePairConfig обновляет конфигурацию пары в движке
+func (e *Engine) UpdatePairConfig(pairID int, cfg *models.PairConfig) {
+	e.pairsMu.RLock()
+	ps, ok := e.pairs[pairID]
+	e.pairsMu.RUnlock()
+
+	if !ok {
+		return
+	}
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Обновляем торговые параметры
+	ps.Config.EntrySpreadPct = cfg.EntrySpreadPct
+	ps.Config.ExitSpreadPct = cfg.ExitSpreadPct
+	ps.Config.VolumeAsset = cfg.VolumeAsset
+	ps.Config.NOrders = cfg.NOrders
+	ps.Config.StopLoss = cfg.StopLoss
+}
+
+// HasOpenPosition проверяет, есть ли открытая позиция у пары
+func (e *Engine) HasOpenPosition(pairID int) bool {
+	e.pairsMu.RLock()
+	ps, ok := e.pairs[pairID]
+	e.pairsMu.RUnlock()
+
+	if !ok {
+		return false
+	}
+
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+
+	// Позиция открыта в состояниях HOLDING, ENTERING или EXITING
+	state := ps.Runtime.State
+	return state == models.StateHolding ||
+		state == models.StateEntering ||
+		state == models.StateExiting
+}
