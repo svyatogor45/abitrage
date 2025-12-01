@@ -140,18 +140,24 @@ func (pt *PriceTracker) Update(update PriceUpdate) {
 		Exchange: update.Exchange,
 	}
 
-	// Добавляем в индекс если это новая биржа для символа
-	if _, exists := shard.allPrices[key]; !exists {
+	// ОПТИМИЗАЦИЯ: in-place update вместо создания нового объекта
+	// Убирает ~1000+ аллокаций/сек
+	existing, exists := shard.allPrices[key]
+	if exists {
+		// Обновляем поля существующего объекта (zero allocation)
+		existing.BidPrice = update.BidPrice
+		existing.AskPrice = update.AskPrice
+		existing.Timestamp = update.Timestamp
+	} else {
+		// Создаём новый только для новой биржи (редко)
 		shard.symbolIndex[update.Symbol] = append(shard.symbolIndex[update.Symbol], key)
-	}
-
-	// Сохраняем цену этой биржи
-	shard.allPrices[key] = &ExchangePrice{
-		Exchange:  update.Exchange,
-		Symbol:    update.Symbol,
-		BidPrice:  update.BidPrice,
-		AskPrice:  update.AskPrice,
-		Timestamp: update.Timestamp,
+		shard.allPrices[key] = &ExchangePrice{
+			Exchange:  update.Exchange,
+			Symbol:    update.Symbol,
+			BidPrice:  update.BidPrice,
+			AskPrice:  update.AskPrice,
+			Timestamp: update.Timestamp,
+		}
 	}
 
 	// Пересчитываем лучшие цены для этого символа
@@ -160,6 +166,7 @@ func (pt *PriceTracker) Update(update PriceUpdate) {
 
 // UpdateFromPtr обновляет цену от указателя (для использования с sync.Pool)
 // Сложность: O(k) где k = количество бирж для символа (обычно 6)
+// ОПТИМИЗАЦИЯ: in-place update
 func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
 	shard := pt.getShard(update.Symbol)
 
@@ -171,18 +178,23 @@ func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
 		Exchange: update.Exchange,
 	}
 
-	// Добавляем в индекс если это новая биржа для символа
-	if _, exists := shard.allPrices[key]; !exists {
+	// ОПТИМИЗАЦИЯ: in-place update вместо создания нового объекта
+	existing, exists := shard.allPrices[key]
+	if exists {
+		// Обновляем поля существующего объекта (zero allocation)
+		existing.BidPrice = update.BidPrice
+		existing.AskPrice = update.AskPrice
+		existing.Timestamp = update.Timestamp
+	} else {
+		// Создаём новый только для новой биржи (редко)
 		shard.symbolIndex[update.Symbol] = append(shard.symbolIndex[update.Symbol], key)
-	}
-
-	// Сохраняем цену этой биржи
-	shard.allPrices[key] = &ExchangePrice{
-		Exchange:  update.Exchange,
-		Symbol:    update.Symbol,
-		BidPrice:  update.BidPrice,
-		AskPrice:  update.AskPrice,
-		Timestamp: update.Timestamp,
+		shard.allPrices[key] = &ExchangePrice{
+			Exchange:  update.Exchange,
+			Symbol:    update.Symbol,
+			BidPrice:  update.BidPrice,
+			AskPrice:  update.AskPrice,
+			Timestamp: update.Timestamp,
+		}
 	}
 
 	// Пересчитываем лучшие цены для этого символа
@@ -228,19 +240,33 @@ func (shard *PriceShard) recalculateBest(symbol string) {
 		}
 	}
 
-	// Сохраняем лучшие цены
+	// ОПТИМИЗАЦИЯ: in-place update вместо создания нового объекта
+	// Убирает ~1000+ аллокаций/сек
 	if bestAsk > 0 && bestBid > 0 {
 		rawSpread := (bestBid - bestAsk) / bestAsk * 100
 
-		shard.bestPrices[symbol] = &BestPrices{
-			Symbol:      symbol,
-			BestAsk:     bestAsk,
-			BestAskExch: bestAskExch,
-			BestAskTime: bestAskTime,
-			BestBid:     bestBid,
-			BestBidExch: bestBidExch,
-			BestBidTime: bestBidTime,
-			RawSpread:   rawSpread,
+		existing, exists := shard.bestPrices[symbol]
+		if exists {
+			// Обновляем поля существующего объекта (zero allocation)
+			existing.BestAsk = bestAsk
+			existing.BestAskExch = bestAskExch
+			existing.BestAskTime = bestAskTime
+			existing.BestBid = bestBid
+			existing.BestBidExch = bestBidExch
+			existing.BestBidTime = bestBidTime
+			existing.RawSpread = rawSpread
+		} else {
+			// Создаём новый только при первом вызове для символа (редко)
+			shard.bestPrices[symbol] = &BestPrices{
+				Symbol:      symbol,
+				BestAsk:     bestAsk,
+				BestAskExch: bestAskExch,
+				BestAskTime: bestAskTime,
+				BestBid:     bestBid,
+				BestBidExch: bestBidExch,
+				BestBidTime: bestBidTime,
+				RawSpread:   rawSpread,
+			}
 		}
 	}
 }

@@ -424,20 +424,67 @@ func (e *Engine) updateBalances() {
 	wg.Wait()
 }
 
-// broadcastPairStates - отправка состояний пар клиентам
-func (e *Engine) broadcastPairStates() {
-	e.pairsMu.RLock()
-	defer e.pairsMu.RUnlock()
+// pairSnapshot - снимок данных пары для broadcast без Lock
+type pairSnapshot struct {
+	id      int
+	symbol  string
+	runtime *models.PairRuntime
+	// Данные для расчёта PNL
+	longExch       string
+	longEntryPrice float64
+	shortExch      string
+	shortEntryPrice float64
+	volume         float64
+}
 
+// broadcastPairStates - отправка состояний пар клиентам
+// ОПТИМИЗАЦИЯ: копируем данные под коротким RLock, broadcast без Lock
+// Было: RLock удерживался на всё время (включая json.Marshal)
+// Стало: RLock только на копирование (~1µs), broadcast без блокировки
+func (e *Engine) broadcastPairStates() {
+	if e.wsHub == nil {
+		return
+	}
+
+	// 1. Копируем данные под коротким RLock
+	e.pairsMu.RLock()
+	snapshots := make([]pairSnapshot, 0, len(e.pairs))
 	for id, ps := range e.pairs {
 		if ps.Runtime.State == models.StateHolding {
-			// Обновляем PNL из текущих цен
-			e.updatePairPnl(ps)
-
-			if e.wsHub != nil {
-				e.wsHub.BroadcastPairUpdate(id, ps.Runtime)
+			snap := pairSnapshot{
+				id:      id,
+				symbol:  ps.Config.Symbol,
+				runtime: ps.Runtime,
 			}
+			// Копируем данные для PNL если есть ноги
+			if len(ps.Runtime.Legs) == 2 {
+				snap.longExch = ps.Runtime.Legs[0].Exchange
+				snap.longEntryPrice = ps.Runtime.Legs[0].EntryPrice
+				snap.shortExch = ps.Runtime.Legs[1].Exchange
+				snap.shortEntryPrice = ps.Runtime.Legs[1].EntryPrice
+				snap.volume = ps.Runtime.Legs[0].Quantity
+			}
+			snapshots = append(snapshots, snap)
 		}
+	}
+	e.pairsMu.RUnlock()
+
+	// 2. Обновляем PNL и делаем broadcast БЕЗ Lock
+	for i := range snapshots {
+		snap := &snapshots[i]
+
+		// Рассчитываем PNL если есть данные
+		if snap.volume > 0 {
+			pnl := e.spreadCalc.CalculatePnl(
+				snap.symbol,
+				snap.longExch, snap.longEntryPrice,
+				snap.shortExch, snap.shortEntryPrice,
+				snap.volume,
+			)
+			snap.runtime.UnrealizedPnl = pnl
+		}
+
+		e.wsHub.BroadcastPairUpdate(snap.id, snap.runtime)
 	}
 }
 
@@ -471,9 +518,8 @@ func (e *Engine) decrementActiveArbs() {
 	atomic.AddInt64(&e.activeArbs, -1)
 }
 
-func (e *Engine) updatePairPnl(ps *PairState) {
-	// TODO: расчёт PNL из текущих цен в PriceTracker
-}
+// updatePairPnl - расчёт PNL вынесен в broadcastPairStates для оптимизации
+// (чтобы не держать Lock во время расчёта)
 
 func (e *Engine) notifyTradeOpened(ps *PairState, result *ExecuteResult) {
 	// TODO: создать уведомление

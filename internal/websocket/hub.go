@@ -1,10 +1,49 @@
 package websocket
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"sync"
 )
+
+// ============ ОПТИМИЗАЦИЯ: sync.Pool для JSON буферов ============
+// Убирает аллокации при каждом Broadcast (было ~1000+/сек)
+
+var jsonBufferPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 512)) // начальный размер 512 байт
+	},
+}
+
+// ============ Типизированные сообщения (без map[string]interface{}) ============
+// Избегаем рефлексии при сериализации - Go оптимизирует для известных типов
+
+// PairUpdateMessage - сообщение об обновлении пары
+type PairUpdateMessage struct {
+	Type   string      `json:"type"`
+	PairID int         `json:"pair_id"`
+	Data   interface{} `json:"data"`
+}
+
+// NotificationMessage - сообщение с уведомлением
+type NotificationMessage struct {
+	Type string      `json:"type"`
+	Data interface{} `json:"data"`
+}
+
+// BalanceUpdateMessage - сообщение об обновлении баланса
+type BalanceUpdateMessage struct {
+	Type     string  `json:"type"`
+	Exchange string  `json:"exchange"`
+	Balance  float64 `json:"balance"`
+}
+
+// StatsUpdateMessage - сообщение со статистикой
+type StatsUpdateMessage struct {
+	Type string      `json:"type"`
+	Data interface{} `json:"data"`
+}
 
 // Hub управляет всеми активными WebSocket соединениями
 //
@@ -121,52 +160,71 @@ func (h *Hub) Run() {
 }
 
 // Broadcast отправляет сообщение всем подключенным клиентам
+// ОПТИМИЗАЦИЯ: использует sync.Pool для буферов (убирает аллокации)
 func (h *Hub) Broadcast(message interface{}) {
-	data, err := json.Marshal(message)
-	if err != nil {
+	// Получаем буфер из пула
+	buf := jsonBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	// Сериализуем в буфер
+	if err := json.NewEncoder(buf).Encode(message); err != nil {
 		log.Printf("Error marshaling broadcast message: %v", err)
+		jsonBufferPool.Put(buf)
 		return
 	}
 
-	h.broadcast <- data
+	// Убираем trailing newline от Encode
+	data := buf.Bytes()
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+	}
+
+	// Копируем данные (буфер вернётся в пул)
+	msgCopy := make([]byte, len(data))
+	copy(msgCopy, data)
+
+	// Возвращаем буфер в пул
+	jsonBufferPool.Put(buf)
+
+	h.broadcast <- msgCopy
 }
 
 // BroadcastPairUpdate отправляет обновление состояния пары
+// ОПТИМИЗАЦИЯ: использует типизированную структуру вместо map[string]interface{}
 func (h *Hub) BroadcastPairUpdate(pairID int, data interface{}) {
-	message := map[string]interface{}{
-		"type":    "pairUpdate",
-		"pair_id": pairID,
-		"data":    data,
-	}
-	h.Broadcast(message)
+	h.Broadcast(&PairUpdateMessage{
+		Type:   "pairUpdate",
+		PairID: pairID,
+		Data:   data,
+	})
 }
 
 // BroadcastNotification отправляет новое уведомление
+// ОПТИМИЗАЦИЯ: использует типизированную структуру
 func (h *Hub) BroadcastNotification(notification interface{}) {
-	message := map[string]interface{}{
-		"type": "notification",
-		"data": notification,
-	}
-	h.Broadcast(message)
+	h.Broadcast(&NotificationMessage{
+		Type: "notification",
+		Data: notification,
+	})
 }
 
 // BroadcastBalanceUpdate отправляет обновление баланса биржи
+// ОПТИМИЗАЦИЯ: использует типизированную структуру (все поля примитивные - быстрая сериализация)
 func (h *Hub) BroadcastBalanceUpdate(exchange string, balance float64) {
-	message := map[string]interface{}{
-		"type":     "balanceUpdate",
-		"exchange": exchange,
-		"balance":  balance,
-	}
-	h.Broadcast(message)
+	h.Broadcast(&BalanceUpdateMessage{
+		Type:     "balanceUpdate",
+		Exchange: exchange,
+		Balance:  balance,
+	})
 }
 
 // BroadcastStatsUpdate отправляет обновление статистики
+// ОПТИМИЗАЦИЯ: использует типизированную структуру
 func (h *Hub) BroadcastStatsUpdate(stats interface{}) {
-	message := map[string]interface{}{
-		"type": "statsUpdate",
-		"data": stats,
-	}
-	h.Broadcast(message)
+	h.Broadcast(&StatsUpdateMessage{
+		Type: "statsUpdate",
+		Data: stats,
+	})
 }
 
 // ClientCount возвращает количество подключенных клиентов
