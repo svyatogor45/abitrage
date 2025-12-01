@@ -15,6 +15,7 @@ type Dependencies struct {
 	ExchangeService *service.ExchangeService
 	PairService     *service.PairService
 	StatsService    *service.StatsService
+	SettingsService *service.SettingsService
 	// TODO: добавить сервисы когда они будут реализованы
 	// NotificationService *service.NotificationService
 }
@@ -93,10 +94,15 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		statsHandler = handlers.NewStatsHandler(deps.StatsService)
 	}
 
+	// Settings handler с внедрением зависимости
+	var settingsHandler *handlers.SettingsHandler
+	if deps != nil && deps.SettingsService != nil {
+		settingsHandler = handlers.NewSettingsHandler(deps.SettingsService)
+	}
+
 	// TODO: аналогично для других handlers когда будут реализованы сервисы
 	notificationHandler := handlers.NewNotificationHandler()
 	blacklistHandler := handlers.NewBlacklistHandler()
-	settingsHandler := handlers.NewSettingsHandler()
 
 	// API v1 routes
 	api := router.PathPrefix("/api/v1").Subrouter()
@@ -141,8 +147,10 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	api.HandleFunc("/blacklist/{symbol}", blacklistHandler.RemoveFromBlacklist).Methods("DELETE")
 
 	// Settings routes
-	api.HandleFunc("/settings", settingsHandler.GetSettings).Methods("GET")
-	api.HandleFunc("/settings", settingsHandler.UpdateSettings).Methods("PATCH")
+	if settingsHandler != nil {
+		api.HandleFunc("/settings", settingsHandler.GetSettings).Methods("GET")
+		api.HandleFunc("/settings", settingsHandler.UpdateSettings).Methods("PATCH")
+	}
 
 	// WebSocket route
 	// TODO: добавить WebSocket handler когда будет реализован

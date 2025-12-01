@@ -39,9 +39,9 @@ func main() {
 	exchangeRepo := repository.NewExchangeRepository(db)
 	pairRepo := repository.NewPairRepository(db)
 	statsRepo := repository.NewStatsRepository(db)
+	settingsRepo := repository.NewSettingsRepository(db)
 	// notificationRepo := repository.NewNotificationRepository(db)
 	// blacklistRepo := repository.NewBlacklistRepository(db)
-	// settingsRepo := repository.NewSettingsRepository(db)
 
 	// Инициализация сервисов
 	exchangeService := service.NewExchangeService(
@@ -63,6 +63,9 @@ func main() {
 		pairRepo,
 	)
 
+	// Инициализация SettingsService
+	settingsService := service.NewSettingsService(settingsRepo)
+
 	// TODO: инициализировать другие сервисы когда они будут реализованы
 	// notificationService := service.NewNotificationService(...)
 
@@ -79,6 +82,7 @@ func main() {
 		ExchangeService: exchangeService,
 		PairService:     pairService,
 		StatsService:    statsService,
+		SettingsService: settingsService,
 		// NotificationService: notificationService,
 	}
 
