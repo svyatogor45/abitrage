@@ -1,30 +1,48 @@
 package bot
 
 import (
+	"hash/fnv"
 	"sync"
 	"time"
 )
 
-// PriceTracker - глобальный трекер лучших цен для O(n) поиска связки
+// PriceTracker - шардированный глобальный трекер лучших цен
+//
+// ОПТИМИЗАЦИИ:
+// 1. Шардирование по символу - разные символы не блокируют друг друга
+// 2. Индекс по символам - O(k) вместо O(n*m) при пересчёте лучших цен
+// 3. Предвычисленные ключи - нет string concatenation в горячем пути
 //
 // Архитектура:
-// - Хранит лучший Ask (для лонга) и лучший Bid (для шорта) по каждому символу
-// - При обновлении цены от любой биржи - O(1) обновление лучших цен
-// - Поиск лучшей арбитражной связки: O(1) - просто берём лучший Ask и лучший Bid
-//
-// Почему это O(n) а не O(n²):
-// - БЕЗ оптимизации: для каждой биржи сравниваем со всеми другими = O(n²)
-// - С оптимизацией: храним только лучшие цены, сравнение = O(1)
+// - numShards шардов, каждый со своим мьютексом
+// - Символ → шард определяется через hash(symbol) % numShards
+// - Внутри шарда: индекс symbol → []exchangeKey для быстрого пересчёта
 type PriceTracker struct {
-	// Лучшие цены по символам
-	// key: symbol, value: лучшие Ask и Bid со всех бирж
+	shards    []*PriceShard
+	numShards uint32
+}
+
+// PriceShard - один шард с собственным мьютексом
+type PriceShard struct {
+	// Лучшие цены по символам в этом шарде
 	bestPrices map[string]*BestPrices
 
-	// Все цены по биржам (для пересчёта при обновлении)
-	// key: "symbol:exchange"
-	allPrices map[string]*ExchangePrice
+	// Все цены по биржам
+	// key: PriceKey{Symbol, Exchange}
+	allPrices map[PriceKey]*ExchangePrice
+
+	// Индекс: symbol → список ключей бирж для быстрого пересчёта
+	// Позволяет итерировать только по биржам этого символа, а не по всем
+	symbolIndex map[string][]PriceKey
 
 	mu sync.RWMutex
+}
+
+// PriceKey - составной ключ без аллокации строк
+// Go оптимизирует struct keys в map
+type PriceKey struct {
+	Symbol   string
+	Exchange string
 }
 
 // BestPrices - лучшие цены для символа
@@ -32,14 +50,14 @@ type BestPrices struct {
 	Symbol string
 
 	// Лучший Ask (самый низкий) - для открытия лонга
-	BestAsk      float64
-	BestAskExch  string
-	BestAskTime  time.Time
+	BestAsk     float64
+	BestAskExch string
+	BestAskTime time.Time
 
 	// Лучший Bid (самый высокий) - для открытия шорта
-	BestBid      float64
-	BestBidExch  string
-	BestBidTime  time.Time
+	BestBid     float64
+	BestBidExch string
+	BestBidTime time.Time
 
 	// Предвычисленный спред (без учёта комиссий)
 	RawSpread float64 // (BestBid - BestAsk) / BestAsk * 100
@@ -54,24 +72,65 @@ type ExchangePrice struct {
 	Timestamp time.Time
 }
 
-// NewPriceTracker создаёт новый трекер
-func NewPriceTracker() *PriceTracker {
-	return &PriceTracker{
-		bestPrices: make(map[string]*BestPrices),
-		allPrices:  make(map[string]*ExchangePrice),
+// NewPriceTracker создаёт шардированный трекер
+// numShards должен соответствовать количеству worker'ов в Engine
+func NewPriceTracker(numShards int) *PriceTracker {
+	if numShards <= 0 {
+		numShards = 16 // дефолт
 	}
+
+	pt := &PriceTracker{
+		shards:    make([]*PriceShard, numShards),
+		numShards: uint32(numShards),
+	}
+
+	for i := 0; i < numShards; i++ {
+		pt.shards[i] = &PriceShard{
+			bestPrices:  make(map[string]*BestPrices),
+			allPrices:   make(map[PriceKey]*ExchangePrice),
+			symbolIndex: make(map[string][]PriceKey),
+		}
+	}
+
+	return pt
+}
+
+// getShard возвращает шард для символа (детерминированно)
+func (pt *PriceTracker) getShard(symbol string) *PriceShard {
+	h := fnv.New32a()
+	h.Write([]byte(symbol))
+	return pt.shards[h.Sum32()%pt.numShards]
+}
+
+// GetShardIndex возвращает индекс шарда для символа
+// Используется Engine для роутинга событий к нужному воркеру
+func (pt *PriceTracker) GetShardIndex(symbol string) int {
+	h := fnv.New32a()
+	h.Write([]byte(symbol))
+	return int(h.Sum32() % pt.numShards)
 }
 
 // Update обновляет цену от биржи и пересчитывает лучшие цены
-// Сложность: O(n) где n = количество бирж (обычно 6)
+// Сложность: O(k) где k = количество бирж для символа (обычно 6)
+// Lock: только на шарде этого символа (не блокирует другие символы)
 func (pt *PriceTracker) Update(update PriceUpdate) {
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
+	shard := pt.getShard(update.Symbol)
 
-	key := update.Symbol + ":" + update.Exchange
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	key := PriceKey{
+		Symbol:   update.Symbol,
+		Exchange: update.Exchange,
+	}
+
+	// Добавляем в индекс если это новая биржа для символа
+	if _, exists := shard.allPrices[key]; !exists {
+		shard.symbolIndex[update.Symbol] = append(shard.symbolIndex[update.Symbol], key)
+	}
 
 	// Сохраняем цену этой биржи
-	pt.allPrices[key] = &ExchangePrice{
+	shard.allPrices[key] = &ExchangePrice{
 		Exchange:  update.Exchange,
 		Symbol:    update.Symbol,
 		BidPrice:  update.BidPrice,
@@ -80,12 +139,49 @@ func (pt *PriceTracker) Update(update PriceUpdate) {
 	}
 
 	// Пересчитываем лучшие цены для этого символа
-	pt.recalculateBest(update.Symbol)
+	shard.recalculateBest(update.Symbol)
+}
+
+// UpdateFromPtr обновляет цену от указателя (для использования с sync.Pool)
+// Сложность: O(k) где k = количество бирж для символа (обычно 6)
+func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
+	shard := pt.getShard(update.Symbol)
+
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	key := PriceKey{
+		Symbol:   update.Symbol,
+		Exchange: update.Exchange,
+	}
+
+	// Добавляем в индекс если это новая биржа для символа
+	if _, exists := shard.allPrices[key]; !exists {
+		shard.symbolIndex[update.Symbol] = append(shard.symbolIndex[update.Symbol], key)
+	}
+
+	// Сохраняем цену этой биржи
+	shard.allPrices[key] = &ExchangePrice{
+		Exchange:  update.Exchange,
+		Symbol:    update.Symbol,
+		BidPrice:  update.BidPrice,
+		AskPrice:  update.AskPrice,
+		Timestamp: update.Timestamp,
+	}
+
+	// Пересчитываем лучшие цены для этого символа
+	shard.recalculateBest(update.Symbol)
 }
 
 // recalculateBest пересчитывает лучшие Ask и Bid для символа
-// Сложность: O(n) где n = количество бирж
-func (pt *PriceTracker) recalculateBest(symbol string) {
+// Сложность: O(k) где k = количество бирж для этого символа
+// ВАЖНО: вызывается под lock'ом шарда
+func (shard *PriceShard) recalculateBest(symbol string) {
+	keys := shard.symbolIndex[symbol]
+	if len(keys) == 0 {
+		return
+	}
+
 	var bestAsk float64 = 0
 	var bestAskExch string
 	var bestAskTime time.Time
@@ -94,9 +190,10 @@ func (pt *PriceTracker) recalculateBest(symbol string) {
 	var bestBidExch string
 	var bestBidTime time.Time
 
-	// Проходим по всем биржам для этого символа
-	for key, price := range pt.allPrices {
-		if price.Symbol != symbol {
+	// Проходим ТОЛЬКО по биржам этого символа (не по всем!)
+	for _, key := range keys {
+		price := shard.allPrices[key]
+		if price == nil {
 			continue
 		}
 
@@ -113,15 +210,13 @@ func (pt *PriceTracker) recalculateBest(symbol string) {
 			bestBidExch = price.Exchange
 			bestBidTime = price.Timestamp
 		}
-
-		_ = key // используем key для итерации
 	}
 
 	// Сохраняем лучшие цены
 	if bestAsk > 0 && bestBid > 0 {
 		rawSpread := (bestBid - bestAsk) / bestAsk * 100
 
-		pt.bestPrices[symbol] = &BestPrices{
+		shard.bestPrices[symbol] = &BestPrices{
 			Symbol:      symbol,
 			BestAsk:     bestAsk,
 			BestAskExch: bestAskExch,
@@ -137,16 +232,20 @@ func (pt *PriceTracker) recalculateBest(symbol string) {
 // GetBestPrices возвращает лучшие цены для символа
 // Сложность: O(1)
 func (pt *PriceTracker) GetBestPrices(symbol string) *BestPrices {
-	pt.mu.RLock()
-	defer pt.mu.RUnlock()
-	return pt.bestPrices[symbol]
+	shard := pt.getShard(symbol)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	return shard.bestPrices[symbol]
 }
 
 // GetExchangePrice возвращает цену конкретной биржи
 func (pt *PriceTracker) GetExchangePrice(symbol, exchange string) *ExchangePrice {
-	pt.mu.RLock()
-	defer pt.mu.RUnlock()
-	return pt.allPrices[symbol+":"+exchange]
+	shard := pt.getShard(symbol)
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+
+	key := PriceKey{Symbol: symbol, Exchange: exchange}
+	return shard.allPrices[key]
 }
 
 // ============================================================
@@ -178,6 +277,7 @@ type ArbitrageOpportunity struct {
 	RawSpread float64 // без комиссий
 	NetSpread float64 // после вычета комиссий (4 сделки)
 
+	// Используем timestamp из лучших цен (без syscall!)
 	Timestamp time.Time
 }
 
@@ -225,7 +325,7 @@ func (sc *SpreadCalculator) GetBestOpportunity(symbol string) *ArbitrageOpportun
 		ShortPrice:    best.BestBid,
 		RawSpread:     best.RawSpread,
 		NetSpread:     netSpread,
-		Timestamp:     time.Now(),
+		Timestamp:     best.BestAskTime, // Используем timestamp из события (проблема 8)
 	}
 }
 
@@ -246,7 +346,7 @@ func (sc *SpreadCalculator) calculateNetSpread(best *BestPrices) float64 {
 	}
 
 	// Суммарные комиссии: 2 сделки на каждой бирже (открытие + закрытие)
-	totalFees := 2*(feeLong+feeShort) * 100 // в процентах
+	totalFees := 2 * (feeLong + feeShort) * 100 // в процентах
 
 	return best.RawSpread - totalFees
 }
