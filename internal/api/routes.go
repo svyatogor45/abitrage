@@ -14,9 +14,9 @@ import (
 type Dependencies struct {
 	ExchangeService *service.ExchangeService
 	PairService     *service.PairService
+	StatsService    *service.StatsService
 	// TODO: добавить сервисы когда они будут реализованы
 	// NotificationService *service.NotificationService
-	// StatsService        *service.StatsService
 }
 
 // SetupRoutes настраивает все HTTP маршруты приложения
@@ -87,9 +87,14 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		pairHandler = handlers.NewPairHandler(deps.PairService)
 	}
 
+	// Stats handler с внедрением зависимости
+	var statsHandler *handlers.StatsHandler
+	if deps != nil && deps.StatsService != nil {
+		statsHandler = handlers.NewStatsHandler(deps.StatsService)
+	}
+
 	// TODO: аналогично для других handlers когда будут реализованы сервисы
 	notificationHandler := handlers.NewNotificationHandler()
-	statsHandler := handlers.NewStatsHandler()
 	blacklistHandler := handlers.NewBlacklistHandler()
 	settingsHandler := handlers.NewSettingsHandler()
 
@@ -124,9 +129,11 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	api.HandleFunc("/notifications", notificationHandler.ClearNotifications).Methods("DELETE")
 
 	// Stats routes
-	api.HandleFunc("/stats", statsHandler.GetStats).Methods("GET")
-	api.HandleFunc("/stats/top-pairs", statsHandler.GetTopPairs).Methods("GET")
-	api.HandleFunc("/stats/reset", statsHandler.ResetStats).Methods("POST")
+	if statsHandler != nil {
+		api.HandleFunc("/stats", statsHandler.GetStats).Methods("GET")
+		api.HandleFunc("/stats/top-pairs", statsHandler.GetTopPairs).Methods("GET")
+		api.HandleFunc("/stats/reset", statsHandler.ResetStats).Methods("POST")
+	}
 
 	// Blacklist routes
 	api.HandleFunc("/blacklist", blacklistHandler.GetBlacklist).Methods("GET")
