@@ -10,6 +10,31 @@ import (
 	"arbitrage/internal/models"
 )
 
+// ============ ОПТИМИЗАЦИЯ: Object Pool для каналов LegResult ============
+// Убирает аллокацию каналов на каждый ордер (100+ ордеров/день)
+// Каналы - относительно "тяжёлые" объекты для GC
+
+var legResultChanPool = sync.Pool{
+	New: func() interface{} {
+		return make(chan LegResult, 1)
+	},
+}
+
+// acquireLegResultChan получает канал из пула
+func acquireLegResultChan() chan LegResult {
+	return legResultChanPool.Get().(chan LegResult)
+}
+
+// releaseLegResultChan очищает и возвращает канал в пул
+func releaseLegResultChan(ch chan LegResult) {
+	// Очищаем канал перед возвратом в пул
+	select {
+	case <-ch:
+	default:
+	}
+	legResultChanPool.Put(ch)
+}
+
 // OrderExecutor - исполнитель ордеров с ПАРАЛЛЕЛЬНОЙ отправкой
 //
 // Ключевая оптимизация:
@@ -64,6 +89,8 @@ func NewOrderExecutor(exchanges map[string]exchange.Exchange, cfg config.BotConf
 // - Отправка ордеров: ~0ms (мгновенный запуск goroutines)
 // - Ожидание ответа: max(latency_A, latency_B) ≈ 150-300ms
 // - БЕЗ параллелизма было бы: latency_A + latency_B ≈ 300-600ms
+//
+// ОПТИМИЗАЦИЯ: использует sync.Pool для каналов - без аллокаций на каждый ордер
 func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecuteParams) *ExecuteResult {
 	oe.mu.RLock()
 	longExch, longOk := oe.exchanges[params.LongExchange]
@@ -78,9 +105,11 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 		}
 	}
 
-	// Каналы для результатов
-	longCh := make(chan LegResult, 1)
-	shortCh := make(chan LegResult, 1)
+	// ОПТИМИЗАЦИЯ: каналы из пула (без аллокации!)
+	longCh := acquireLegResultChan()
+	shortCh := acquireLegResultChan()
+	defer releaseLegResultChan(longCh)
+	defer releaseLegResultChan(shortCh)
 
 	// Объём для одной части (если разбиваем на N ордеров)
 	partVolume := params.Volume
@@ -210,6 +239,8 @@ func (oe *OrderExecutor) rollbackShort(symbol string, exch exchange.Exchange, or
 }
 
 // CloseParallel закрывает обе позиции параллельно
+//
+// ОПТИМИЗАЦИЯ: использует sync.Pool для каналов - без аллокаций на каждый ордер
 func (oe *OrderExecutor) CloseParallel(ctx context.Context, legs []models.Leg, symbol string) *ExecuteResult {
 	if len(legs) != 2 {
 		return &ExecuteResult{Success: false, Error: fmt.Errorf("expected 2 legs, got %d", len(legs))}
@@ -224,9 +255,11 @@ func (oe *OrderExecutor) CloseParallel(ctx context.Context, legs []models.Leg, s
 		return &ExecuteResult{Success: false, Error: fmt.Errorf("exchange not found")}
 	}
 
-	// Каналы для результатов
-	ch1 := make(chan LegResult, 1)
-	ch2 := make(chan LegResult, 1)
+	// ОПТИМИЗАЦИЯ: каналы из пула (без аллокации!)
+	ch1 := acquireLegResultChan()
+	ch2 := acquireLegResultChan()
+	defer releaseLegResultChan(ch1)
+	defer releaseLegResultChan(ch2)
 
 	// Параллельное закрытие
 	go func() {
