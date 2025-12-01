@@ -45,6 +45,7 @@ func releasePriceUpdate(p *PriceUpdate) {
 // 2. Индекс pairsBySymbol - O(1) поиск пар вместо O(n)
 // 3. Atomic counter для activeArbs - нет вложенных локов
 // 4. Шардированный PriceTracker - нет lock contention между символами
+// 5. Несколько workers на шард - увеличенная пропускная способность
 //
 // Архитектура:
 // - НЕТ polling! Только реакция на события от WebSocket
@@ -53,7 +54,7 @@ func releasePriceUpdate(p *PriceUpdate) {
 // - O(1) поиск лучшей связки через шардированный PriceTracker
 //
 // Поток данных:
-// WebSocket → Router (hash by symbol) → Worker[N] → PriceTracker[shard] → ArbitrageCheck
+// WebSocket → Router (hash by symbol) → Worker[N×M] → PriceTracker[shard] → ArbitrageCheck
 type Engine struct {
 	cfg *config.Config
 
@@ -79,8 +80,9 @@ type Engine struct {
 	orderExec *OrderExecutor
 
 	// Worker pool: шардированные каналы по символам
-	priceShards []*priceShard
-	numShards   int
+	priceShards     []*priceShard
+	numShards       int
+	workersPerShard int // ОПТИМИЗАЦИЯ: несколько workers на шард
 
 	// Канал для позиций (отдельный, не шардируется)
 	positionUpdates chan PositionUpdate
@@ -141,6 +143,10 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 		numShards = 32 // максимум 32 (не нужно больше для 30 пар)
 	}
 
+	// ОПТИМИЗАЦИЯ: несколько workers на шард для увеличения пропускной способности
+	// При 1000+ обновлений/сек один worker может не справиться
+	workersPerShard := 2 // 2 workers на шард (можно увеличить до 4)
+
 	e := &Engine{
 		cfg:             cfg,
 		exchanges:       make(map[string]exchange.Exchange),
@@ -149,6 +155,7 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 		priceTracker:    NewPriceTracker(numShards),
 		priceShards:     make([]*priceShard, numShards),
 		numShards:       numShards,
+		workersPerShard: workersPerShard,
 		positionUpdates: make(chan PositionUpdate, 1000),
 		shutdown:        make(chan struct{}),
 		wsHub:           wsHub,
@@ -168,10 +175,14 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 }
 
 // Run запускает event-driven движок с worker pool
+// ОПТИМИЗАЦИЯ: запуск нескольких workers на шард для увеличения пропускной способности
 func (e *Engine) Run(ctx context.Context) error {
-	// Запуск N воркеров для обработки ценовых событий
-	for i := 0; i < e.numShards; i++ {
-		go e.priceEventWorker(ctx, i)
+	// Запуск M воркеров на каждый из N шардов (итого N×M воркеров)
+	// Это позволяет обрабатывать больше обновлений цен параллельно
+	for shardIdx := 0; shardIdx < e.numShards; shardIdx++ {
+		for workerIdx := 0; workerIdx < e.workersPerShard; workerIdx++ {
+			go e.priceEventWorker(ctx, shardIdx)
+		}
 	}
 
 	// Остальные воркеры
@@ -459,10 +470,9 @@ func (e *Engine) subscribeToExchange(name string, exch exchange.Exchange) {
 }
 
 // AddPair добавляет торговую пару
+// ОПТИМИЗАЦИЯ: Фиксированный порядок блокировок для предотвращения deadlock
+// Порядок: pairsMu → pairsBySymbolMu (ВСЕГДА в этом порядке!)
 func (e *Engine) AddPair(cfg *models.PairConfig) {
-	e.pairsMu.Lock()
-	defer e.pairsMu.Unlock()
-
 	ps := &PairState{
 		Config: cfg,
 		Runtime: &models.PairRuntime{
@@ -471,24 +481,33 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 		},
 	}
 
-	e.pairs[cfg.ID] = ps
-
-	// ОПТИМИЗАЦИЯ: Обновляем индекс по символу
+	// Блокируем ОБА мьютекса в фиксированном порядке
+	e.pairsMu.Lock()
 	e.pairsBySymbolMu.Lock()
-	e.pairsBySymbol[cfg.Symbol] = append(e.pairsBySymbol[cfg.Symbol], ps)
-	e.pairsBySymbolMu.Unlock()
 
-	// Подписываемся на цены этого символа на всех биржах
+	e.pairs[cfg.ID] = ps
+	e.pairsBySymbol[cfg.Symbol] = append(e.pairsBySymbol[cfg.Symbol], ps)
+
+	// Разблокируем в обратном порядке
+	e.pairsBySymbolMu.Unlock()
+	e.pairsMu.Unlock()
+
+	// Подписываемся на цены ПОСЛЕ освобождения locks (избегаем длительного удержания)
 	e.subscribeToSymbol(cfg.Symbol)
 }
 
 // RemovePair удаляет торговую пару
+// ОПТИМИЗАЦИЯ: Фиксированный порядок блокировок для предотвращения deadlock
+// Порядок: pairsMu → pairsBySymbolMu (ВСЕГДА в этом порядке!)
 func (e *Engine) RemovePair(pairID int) {
+	// Блокируем ОБА мьютекса в фиксированном порядке
 	e.pairsMu.Lock()
-	defer e.pairsMu.Unlock()
+	e.pairsBySymbolMu.Lock()
 
 	ps, ok := e.pairs[pairID]
 	if !ok {
+		e.pairsBySymbolMu.Unlock()
+		e.pairsMu.Unlock()
 		return
 	}
 
@@ -496,7 +515,6 @@ func (e *Engine) RemovePair(pairID int) {
 	delete(e.pairs, pairID)
 
 	// Обновляем индекс по символу
-	e.pairsBySymbolMu.Lock()
 	pairs := e.pairsBySymbol[symbol]
 	for i, p := range pairs {
 		if p.Config.ID == pairID {
@@ -507,7 +525,10 @@ func (e *Engine) RemovePair(pairID int) {
 	if len(e.pairsBySymbol[symbol]) == 0 {
 		delete(e.pairsBySymbol, symbol)
 	}
+
+	// Разблокируем в обратном порядке
 	e.pairsBySymbolMu.Unlock()
+	e.pairsMu.Unlock()
 }
 
 // subscribeToSymbol подписывается на цены символа на всех биржах

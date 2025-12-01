@@ -1,10 +1,28 @@
 package bot
 
 import (
-	"hash/fnv"
 	"sync"
 	"time"
 )
+
+// ============ ОПТИМИЗАЦИЯ: Inline FNV-1a hash без аллокаций ============
+// Константы FNV-1a для 32-битного хэша
+const (
+	fnvOffset32 = uint32(2166136261)
+	fnvPrime32  = uint32(16777619)
+)
+
+// fnvHash вычисляет FNV-1a hash строки БЕЗ аллокаций
+// В отличие от fnv.New32a() не создаёт объект на куче
+// Экономит ~2000+ аллокаций/сек в горячем пути
+func fnvHash(s string) uint32 {
+	h := fnvOffset32
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= fnvPrime32
+	}
+	return h
+}
 
 // PriceTracker - шардированный глобальный трекер лучших цен
 //
@@ -96,18 +114,16 @@ func NewPriceTracker(numShards int) *PriceTracker {
 }
 
 // getShard возвращает шард для символа (детерминированно)
+// ОПТИМИЗАЦИЯ: inline FNV-1a без аллокаций (было fnv.New32a() + []byte conversion)
 func (pt *PriceTracker) getShard(symbol string) *PriceShard {
-	h := fnv.New32a()
-	h.Write([]byte(symbol))
-	return pt.shards[h.Sum32()%pt.numShards]
+	return pt.shards[fnvHash(symbol)%pt.numShards]
 }
 
 // GetShardIndex возвращает индекс шарда для символа
 // Используется Engine для роутинга событий к нужному воркеру
+// ОПТИМИЗАЦИЯ: inline FNV-1a без аллокаций
 func (pt *PriceTracker) GetShardIndex(symbol string) int {
-	h := fnv.New32a()
-	h.Write([]byte(symbol))
-	return int(h.Sum32() % pt.numShards)
+	return int(fnvHash(symbol) % pt.numShards)
 }
 
 // Update обновляет цену от биржи и пересчитывает лучшие цены
