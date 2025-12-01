@@ -5,9 +5,19 @@ import (
 
 	"arbitrage/internal/api/handlers"
 	"arbitrage/internal/api/middleware"
+	"arbitrage/internal/service"
 
 	"github.com/gorilla/mux"
 )
+
+// Dependencies содержит все зависимости для API handlers
+type Dependencies struct {
+	ExchangeService *service.ExchangeService
+	PairService     *service.PairService
+	// TODO: добавить сервисы когда они будут реализованы
+	// NotificationService *service.NotificationService
+	// StatsService        *service.StatsService
+}
 
 // SetupRoutes настраивает все HTTP маршруты приложения
 //
@@ -20,43 +30,45 @@ import (
 // Структура маршрутов:
 //
 // /api/v1/
-//   ├── /exchanges/
-//   │   ├── GET / - список бирж
-//   │   ├── POST /{name}/connect - подключить биржу
-//   │   ├── DELETE /{name}/connect - отключить биржу
-//   │   └── GET /{name}/balance - получить баланс
-//   ├── /pairs/
-//   │   ├── GET / - список пар
-//   │   ├── POST / - создать пару
-//   │   ├── GET /{id} - получить пару
-//   │   ├── PATCH /{id} - обновить пару
-//   │   ├── DELETE /{id} - удалить пару
-//   │   ├── POST /{id}/start - запустить пару
-//   │   └── POST /{id}/pause - приостановить пару
-//   ├── /notifications/
-//   │   ├── GET / - получить уведомления
-//   │   └── DELETE / - очистить журнал
-//   ├── /stats/
-//   │   ├── GET / - получить статистику
-//   │   ├── GET /top-pairs - топ-5 пар
-//   │   └── POST /reset - сбросить счетчики
-//   ├── /blacklist/
-//   │   ├── GET / - получить черный список
-//   │   ├── POST / - добавить в черный список
-//   │   └── DELETE /{symbol} - удалить из черного списка
-//   └── /settings/
-//       ├── GET / - получить настройки
-//       └── PATCH / - обновить настройки
+//
+//	├── /exchanges/
+//	│   ├── GET / - список бирж
+//	│   ├── POST /{name}/connect - подключить биржу
+//	│   ├── DELETE /{name}/connect - отключить биржу
+//	│   └── GET /{name}/balance - получить баланс
+//	├── /pairs/
+//	│   ├── GET / - список пар
+//	│   ├── POST / - создать пару
+//	│   ├── GET /{id} - получить пару
+//	│   ├── PATCH /{id} - обновить пару
+//	│   ├── DELETE /{id} - удалить пару
+//	│   ├── POST /{id}/start - запустить пару
+//	│   └── POST /{id}/pause - приостановить пару
+//	├── /notifications/
+//	│   ├── GET / - получить уведомления
+//	│   └── DELETE / - очистить журнал
+//	├── /stats/
+//	│   ├── GET / - получить статистику
+//	│   ├── GET /top-pairs - топ-5 пар
+//	│   └── POST /reset - сбросить счетчики
+//	├── /blacklist/
+//	│   ├── GET / - получить черный список
+//	│   ├── POST / - добавить в черный список
+//	│   └── DELETE /{symbol} - удалить из черного списка
+//	└── /settings/
+//	    ├── GET / - получить настройки
+//	    └── PATCH / - обновить настройки
 //
 // /ws/
-//   └── /stream - WebSocket для real-time обновлений
+//
+//	└── /stream - WebSocket для real-time обновлений
 //
 // Middleware применяется в следующем порядке:
 // 1. Recovery (для всех маршрутов)
 // 2. Logging (для всех маршрутов)
 // 3. CORS (для всех маршрутов)
 // 4. Auth (только для защищенных маршрутов)
-func SetupRoutes() *mux.Router {
+func SetupRoutes(deps *Dependencies) *mux.Router {
 	router := mux.NewRouter()
 
 	// Глобальные middleware (применяются ко всем маршрутам)
@@ -64,8 +76,13 @@ func SetupRoutes() *mux.Router {
 	router.Use(middleware.Logging)
 	router.Use(middleware.CORS)
 
-	// Создание handlers
-	exchangeHandler := handlers.NewExchangeHandler()
+	// Создание handlers с внедрением зависимостей
+	var exchangeHandler *handlers.ExchangeHandler
+	if deps != nil && deps.ExchangeService != nil {
+		exchangeHandler = handlers.NewExchangeHandler(deps.ExchangeService)
+	}
+
+	// TODO: аналогично для других handlers когда будут реализованы сервисы
 	pairHandler := handlers.NewPairHandler()
 	notificationHandler := handlers.NewNotificationHandler()
 	statsHandler := handlers.NewStatsHandler()
@@ -80,10 +97,12 @@ func SetupRoutes() *mux.Router {
 	// api.Use(middleware.Auth)
 
 	// Exchange routes
-	api.HandleFunc("/exchanges", exchangeHandler.GetExchanges).Methods("GET")
-	api.HandleFunc("/exchanges/{name}/connect", exchangeHandler.ConnectExchange).Methods("POST")
-	api.HandleFunc("/exchanges/{name}/connect", exchangeHandler.DisconnectExchange).Methods("DELETE")
-	api.HandleFunc("/exchanges/{name}/balance", exchangeHandler.GetExchangeBalance).Methods("GET")
+	if exchangeHandler != nil {
+		api.HandleFunc("/exchanges", exchangeHandler.GetExchanges).Methods("GET")
+		api.HandleFunc("/exchanges/{name}/connect", exchangeHandler.ConnectExchange).Methods("POST")
+		api.HandleFunc("/exchanges/{name}/connect", exchangeHandler.DisconnectExchange).Methods("DELETE")
+		api.HandleFunc("/exchanges/{name}/balance", exchangeHandler.GetExchangeBalance).Methods("GET")
+	}
 
 	// Pair routes
 	api.HandleFunc("/pairs", pairHandler.GetPairs).Methods("GET")
