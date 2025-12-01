@@ -42,10 +42,11 @@ func releasePriceUpdate(p *PriceUpdate) {
 //
 // ОПТИМИЗАЦИИ:
 // 1. Worker Pool - N воркеров с шардированием по символу (параллельная обработка)
-// 2. Индекс pairsBySymbol - O(1) поиск пар вместо O(n)
+// 2. Индекс pairsBySymbol - O(1) поиск пар вместо O(n) (sync.Map для lock-free чтения)
 // 3. Atomic counter для activeArbs - нет вложенных локов
 // 4. Шардированный PriceTracker - нет lock contention между символами
 // 5. Несколько workers на шард - увеличенная пропускная способность
+// 6. sync.Map для pairsBySymbol - lock-free чтение в горячем пути
 //
 // Архитектура:
 // - НЕТ polling! Только реакция на события от WebSocket
@@ -66,9 +67,10 @@ type Engine struct {
 	pairs   map[int]*PairState
 	pairsMu sync.RWMutex
 
-	// ОПТИМИЗАЦИЯ: Индекс пар по символу для O(1) поиска
-	pairsBySymbol   map[string][]*PairState
-	pairsBySymbolMu sync.RWMutex
+	// ОПТИМИЗАЦИЯ: sync.Map для lock-free чтения в горячем пути
+	// map[string][]*PairState - индекс пар по символу
+	// sync.Map оптимизирована для случая частых чтений и редких записей
+	pairsBySymbol sync.Map
 
 	// Шардированный трекер лучших цен
 	priceTracker *PriceTracker
@@ -105,6 +107,11 @@ type PairState struct {
 	Config  *models.PairConfig
 	Runtime *models.PairRuntime
 	mu      sync.RWMutex
+
+	// ОПТИМИЗАЦИЯ: atomic флаг для быстрой проверки без Lock
+	// 1 = active и ready для торговли, 0 = неактивна
+	// Позволяет быстро отсеять неактивные пары без захвата mutex
+	isReady int32
 }
 
 // PriceUpdate - событие обновления цены от WebSocket
@@ -151,7 +158,7 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 		cfg:             cfg,
 		exchanges:       make(map[string]exchange.Exchange),
 		pairs:           make(map[int]*PairState),
-		pairsBySymbol:   make(map[string][]*PairState),
+		// pairsBySymbol: sync.Map инициализируется автоматически (zero value)
 		priceTracker:    NewPriceTracker(numShards),
 		priceShards:     make([]*priceShard, numShards),
 		numShards:       numShards,
@@ -249,18 +256,25 @@ func (e *Engine) handlePriceUpdate(update *PriceUpdate) {
 }
 
 // checkArbitrageOpportunity - проверка арбитражной возможности для пары
-// ОПТИМИЗАЦИЯ: atomic counter вместо вложенного лока
+// ОПТИМИЗАЦИЯ: atomic быстрая проверка + atomic counter для activeArbs
 func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-
-	// Пропускаем если пара не активна или уже в позиции
-	if ps.Config.Status != "active" || ps.Runtime.State != models.StateReady {
+	// ОПТИМИЗАЦИЯ: быстрая проверка без Lock
+	// Если пара не ready, пропускаем без захвата mutex
+	if atomic.LoadInt32(&ps.isReady) != 1 {
 		return
 	}
 
 	// Проверка лимита одновременных арбитражей (atomic - без lock!)
 	if !e.canOpenNewArbitrage() {
+		return
+	}
+
+	// Теперь захватываем Lock для полной проверки и изменения состояния
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Повторная проверка под Lock (double-check pattern)
+	if ps.Config.Status != "active" || ps.Runtime.State != models.StateReady {
 		return
 	}
 
@@ -277,6 +291,7 @@ func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 
 	// ВХОДИМ! Переключаем состояние и запускаем исполнение
 	ps.Runtime.State = models.StateEntering
+	atomic.StoreInt32(&ps.isReady, 0) // Сбрасываем флаг
 	e.incrementActiveArbs()
 
 	// Асинхронный вход (не блокируем обработку других событий)
@@ -326,6 +341,8 @@ func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
 	} else {
 		// Ошибка - возврат в готовность
 		ps.Runtime.State = models.StateReady
+		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
+		atomic.StoreInt32(&ps.isReady, 1)
 		e.decrementActiveArbs()
 
 		e.notifyError(ps, result.Error)
@@ -372,19 +389,39 @@ func (e *Engine) periodicTasks(ctx context.Context) {
 }
 
 // updateBalances - обновление балансов для UI
+// ОПТИМИЗАЦИЯ: параллельные запросы к биржам вместо последовательных
+// Было: 6 бирж × 500ms = 3 сек с удерживанием RLock
+// Стало: max(500ms) параллельно, RLock только на копирование
 func (e *Engine) updateBalances() {
+	// Копируем биржи под коротким RLock
 	e.exchMu.RLock()
-	defer e.exchMu.RUnlock()
-
+	exchanges := make(map[string]exchange.Exchange, len(e.exchanges))
 	for name, exch := range e.exchanges {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		balance, err := exch.GetBalance(ctx)
-		cancel()
-
-		if err == nil && e.wsHub != nil {
-			e.wsHub.BroadcastBalanceUpdate(name, balance)
-		}
+		exchanges[name] = exch
 	}
+	e.exchMu.RUnlock()
+
+	if len(exchanges) == 0 {
+		return
+	}
+
+	// Параллельные запросы БЕЗ удержания Lock
+	var wg sync.WaitGroup
+	for name, exch := range exchanges {
+		wg.Add(1)
+		go func(exchName string, ex exchange.Exchange) {
+			defer wg.Done()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			balance, err := ex.GetBalance(ctx)
+			if err == nil && e.wsHub != nil {
+				e.wsHub.BroadcastBalanceUpdate(exchName, balance)
+			}
+		}(name, exch)
+	}
+	wg.Wait()
 }
 
 // broadcastPairStates - отправка состояний пар клиентам
@@ -406,11 +443,14 @@ func (e *Engine) broadcastPairStates() {
 
 // ============ Оптимизированные вспомогательные методы ============
 
-// getPairsForSymbol - O(1) поиск через индекс вместо O(n)
+// getPairsForSymbol - O(1) lock-free поиск через sync.Map
+// ОПТИМИЗАЦИЯ: sync.Map не требует блокировки для чтения (lock-free)
+// При 1000+ вызовов/сек это убирает contention с AddPair/RemovePair
 func (e *Engine) getPairsForSymbol(symbol string) []*PairState {
-	e.pairsBySymbolMu.RLock()
-	defer e.pairsBySymbolMu.RUnlock()
-	return e.pairsBySymbol[symbol]
+	if v, ok := e.pairsBySymbol.Load(symbol); ok {
+		return v.([]*PairState)
+	}
+	return nil
 }
 
 // canOpenNewArbitrage - atomic проверка без lock
@@ -470,8 +510,7 @@ func (e *Engine) subscribeToExchange(name string, exch exchange.Exchange) {
 }
 
 // AddPair добавляет торговую пару
-// ОПТИМИЗАЦИЯ: Фиксированный порядок блокировок для предотвращения deadlock
-// Порядок: pairsMu → pairsBySymbolMu (ВСЕГДА в этом порядке!)
+// ОПТИМИЗАЦИЯ: sync.Map для pairsBySymbol - атомарное обновление без блокировки чтений
 func (e *Engine) AddPair(cfg *models.PairConfig) {
 	ps := &PairState{
 		Config: cfg,
@@ -481,54 +520,82 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 		},
 	}
 
-	// Блокируем ОБА мьютекса в фиксированном порядке
+	// Добавляем в основной map под lock
 	e.pairsMu.Lock()
-	e.pairsBySymbolMu.Lock()
-
 	e.pairs[cfg.ID] = ps
-	e.pairsBySymbol[cfg.Symbol] = append(e.pairsBySymbol[cfg.Symbol], ps)
-
-	// Разблокируем в обратном порядке
-	e.pairsBySymbolMu.Unlock()
 	e.pairsMu.Unlock()
 
-	// Подписываемся на цены ПОСЛЕ освобождения locks (избегаем длительного удержания)
+	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map
+	// Используем Load → modify → Store паттерн
+	for {
+		existing, _ := e.pairsBySymbol.Load(cfg.Symbol)
+		var newSlice []*PairState
+		if existing != nil {
+			oldSlice := existing.([]*PairState)
+			newSlice = make([]*PairState, len(oldSlice)+1)
+			copy(newSlice, oldSlice)
+			newSlice[len(oldSlice)] = ps
+		} else {
+			newSlice = []*PairState{ps}
+		}
+		// Атомарная замена (если значение изменилось, повторяем)
+		if existing == nil {
+			if _, loaded := e.pairsBySymbol.LoadOrStore(cfg.Symbol, newSlice); !loaded {
+				break
+			}
+		} else {
+			if e.pairsBySymbol.CompareAndSwap(cfg.Symbol, existing, newSlice) {
+				break
+			}
+		}
+	}
+
+	// Подписываемся на цены ПОСЛЕ обновления индекса
 	e.subscribeToSymbol(cfg.Symbol)
 }
 
 // RemovePair удаляет торговую пару
-// ОПТИМИЗАЦИЯ: Фиксированный порядок блокировок для предотвращения deadlock
-// Порядок: pairsMu → pairsBySymbolMu (ВСЕГДА в этом порядке!)
+// ОПТИМИЗАЦИЯ: sync.Map для pairsBySymbol - атомарное обновление без блокировки чтений
 func (e *Engine) RemovePair(pairID int) {
-	// Блокируем ОБА мьютекса в фиксированном порядке
+	// Получаем пару под lock
 	e.pairsMu.Lock()
-	e.pairsBySymbolMu.Lock()
-
 	ps, ok := e.pairs[pairID]
 	if !ok {
-		e.pairsBySymbolMu.Unlock()
 		e.pairsMu.Unlock()
 		return
 	}
-
 	symbol := ps.Config.Symbol
 	delete(e.pairs, pairID)
+	e.pairsMu.Unlock()
 
-	// Обновляем индекс по символу
-	pairs := e.pairsBySymbol[symbol]
-	for i, p := range pairs {
-		if p.Config.ID == pairID {
-			e.pairsBySymbol[symbol] = append(pairs[:i], pairs[i+1:]...)
-			break
+	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map
+	for {
+		existing, ok := e.pairsBySymbol.Load(symbol)
+		if !ok {
+			break // Уже удалено
+		}
+
+		oldSlice := existing.([]*PairState)
+		var newSlice []*PairState
+
+		// Ищем и удаляем пару
+		for _, p := range oldSlice {
+			if p.Config.ID != pairID {
+				newSlice = append(newSlice, p)
+			}
+		}
+
+		// Если слайс пустой - удаляем ключ
+		if len(newSlice) == 0 {
+			if e.pairsBySymbol.CompareAndDelete(symbol, existing) {
+				break
+			}
+		} else {
+			if e.pairsBySymbol.CompareAndSwap(symbol, existing, newSlice) {
+				break
+			}
 		}
 	}
-	if len(e.pairsBySymbol[symbol]) == 0 {
-		delete(e.pairsBySymbol, symbol)
-	}
-
-	// Разблокируем в обратном порядке
-	e.pairsBySymbolMu.Unlock()
-	e.pairsMu.Unlock()
 }
 
 // subscribeToSymbol подписывается на цены символа на всех биржах
@@ -553,24 +620,31 @@ func (e *Engine) subscribeToSymbol(symbol string) {
 
 // StartPair запускает мониторинг пары
 func (e *Engine) StartPair(pairID int) error {
-	e.pairsMu.Lock()
-	defer e.pairsMu.Unlock()
+	e.pairsMu.RLock()
+	ps, ok := e.pairs[pairID]
+	e.pairsMu.RUnlock()
 
-	if ps, ok := e.pairs[pairID]; ok {
+	if ok {
 		ps.mu.Lock()
 		ps.Config.Status = "active"
 		ps.Runtime.State = models.StateReady
 		ps.mu.Unlock()
+		// ОПТИМИЗАЦИЯ: устанавливаем atomic флаг для быстрой проверки
+		atomic.StoreInt32(&ps.isReady, 1)
 	}
 	return nil
 }
 
 // PausePair останавливает пару
 func (e *Engine) PausePair(pairID int) error {
-	e.pairsMu.Lock()
-	defer e.pairsMu.Unlock()
+	e.pairsMu.RLock()
+	ps, ok := e.pairs[pairID]
+	e.pairsMu.RUnlock()
 
-	if ps, ok := e.pairs[pairID]; ok {
+	if ok {
+		// ОПТИМИЗАЦИЯ: сначала сбрасываем atomic флаг (быстрая блокировка новых проверок)
+		atomic.StoreInt32(&ps.isReady, 0)
+
 		ps.mu.Lock()
 		ps.Config.Status = "paused"
 		ps.Runtime.State = models.StatePaused
