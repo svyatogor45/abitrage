@@ -19,12 +19,15 @@ const (
 	pingPeriod = (pongWait * 9) / 10
 
 	// Максимальный размер сообщения
-	maxMessageSize = 512
+	// ОПТИМИЗАЦИЯ: увеличено с 512 до 65536 (64KB)
+	// Причина: JSON с состоянием пары (Legs, PNL, цены) легко превышает 512 байт
+	// Типичный размер сообщения pairUpdate: 1-4KB
+	maxMessageSize = 65536
 )
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
+	ReadBufferSize:  4096,  // увеличено для больших сообщений
+	WriteBufferSize: 4096,  // увеличено для больших сообщений
 	CheckOrigin: func(r *http.Request) bool {
 		// TODO: проверять origin в production
 		return true
@@ -126,11 +129,24 @@ func (c *Client) writePump() {
 			}
 			w.Write(message)
 
-			// Добавляем все ожидающие сообщения в текущий WebSocket кадр
-			n := len(c.send)
-			for i := 0; i < n; i++ {
-				w.Write([]byte{'\n'})
-				w.Write(<-c.send)
+			// ОПТИМИЗАЦИЯ: безопасное чтение из буфера без race condition
+			// Было: n := len(c.send); for i := 0; i < n; i++ { <-c.send }
+			// Проблема: между len() и <- канал мог измениться
+			// Решение: non-blocking select в цикле
+		drainLoop:
+			for {
+				select {
+				case msg, ok := <-c.send:
+					if !ok {
+						// Канал закрыт
+						break drainLoop
+					}
+					w.Write([]byte{'\n'})
+					w.Write(msg)
+				default:
+					// Буфер пуст - выходим
+					break drainLoop
+				}
 			}
 
 			if err := w.Close(); err != nil {
