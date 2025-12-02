@@ -86,8 +86,81 @@ services:
     depends_on:
       - app
 
+  # ============================================================
+  # Мониторинг: Prometheus
+  # ============================================================
+  # Сбор и хранение метрик торгового ядра
+  # UI: http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: arbitrage-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - arbitrage-network
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  # ============================================================
+  # Мониторинг: Alertmanager
+  # ============================================================
+  # Обработка и маршрутизация алертов
+  # UI: http://localhost:9093
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: arbitrage-alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "9093:9093"
+    networks:
+      - arbitrage-network
+    restart: unless-stopped
+
+  # ============================================================
+  # Мониторинг: Grafana (опционально)
+  # ============================================================
+  # Визуализация метрик и дашборды
+  # UI: http://localhost:3001 (admin/admin)
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: arbitrage-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - arbitrage-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   postgres_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  alertmanager_data:
+    driver: local
+  grafana_data:
     driver: local
 
 networks:

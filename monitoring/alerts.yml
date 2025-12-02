@@ -1,0 +1,295 @@
+# Правила алертов для арбитражного бота
+#
+# Согласно требованиям из Разработка.md:
+# - Tick→Order > 10ms warning, > 50ms critical
+# - Алерты на переполнение буферов
+# - Мониторинг состояния бирж и торговых пар
+#
+# Документация: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+
+groups:
+  # ============================================================
+  # Группа: Латентность торгового ядра
+  # ============================================================
+  - name: trading_latency
+    interval: 10s
+    rules:
+      # WARNING: Tick→Order > 10ms (p95)
+      - alert: TickToOrderLatencyWarning
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(arbitrage_trading_tick_to_order_latency_ms_bucket[1m])) by (le, symbol)
+          ) > 10
+        for: 1m
+        labels:
+          severity: warning
+          component: trading_engine
+        annotations:
+          summary: "Высокая латентность tick-to-order ({{ $labels.symbol }})"
+          description: |
+            P95 латентность tick-to-order превысила 10ms.
+            Текущее значение: {{ $value | printf "%.2f" }}ms
+            Символ: {{ $labels.symbol }}
+            Рекомендация: Проверить нагрузку на систему и сетевые задержки.
+
+      # CRITICAL: Tick→Order > 50ms (p95)
+      - alert: TickToOrderLatencyCritical
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(arbitrage_trading_tick_to_order_latency_ms_bucket[1m])) by (le, symbol)
+          ) > 50
+        for: 30s
+        labels:
+          severity: critical
+          component: trading_engine
+        annotations:
+          summary: "КРИТИЧЕСКАЯ латентность tick-to-order ({{ $labels.symbol }})"
+          description: |
+            P95 латентность tick-to-order превысила 50ms - критический порог!
+            Текущее значение: {{ $value | printf "%.2f" }}ms
+            Символ: {{ $labels.symbol }}
+            ДЕЙСТВИЕ: Немедленно проверить состояние системы!
+
+      # WARNING: Высокая латентность обработки цен
+      - alert: PriceUpdateLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(arbitrage_trading_price_update_latency_ms_bucket[1m])) by (le)
+          ) > 5
+        for: 2m
+        labels:
+          severity: warning
+          component: price_processor
+        annotations:
+          summary: "Высокая латентность обработки цен"
+          description: |
+            P95 латентность обработки ценовых обновлений превысила 5ms.
+            Текущее значение: {{ $value | printf "%.2f" }}ms
+            Это может влиять на своевременность арбитражных сделок.
+
+      # WARNING: Медленное исполнение ордеров
+      - alert: OrderExecutionSlow
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(arbitrage_trading_order_execution_latency_ms_bucket[5m])) by (le, exchange)
+          ) > 2000
+        for: 5m
+        labels:
+          severity: warning
+          component: order_executor
+        annotations:
+          summary: "Медленное исполнение ордеров ({{ $labels.exchange }})"
+          description: |
+            P95 время исполнения ордеров на бирже {{ $labels.exchange }} превысило 2 секунды.
+            Текущее значение: {{ $value | printf "%.0f" }}ms
+            Возможные причины: проблемы с API биржи, сетевые задержки.
+
+  # ============================================================
+  # Группа: Переполнение буферов и производительность
+  # ============================================================
+  - name: buffer_overflow
+    interval: 15s
+    rules:
+      # CRITICAL: Переполнение буферов (события теряются!)
+      - alert: BufferOverflowDetected
+        expr: |
+          increase(arbitrage_trading_buffer_overflows_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: event_processing
+        annotations:
+          summary: "Обнаружено переполнение буфера: {{ $labels.buffer }}"
+          description: |
+            Буфер {{ $labels.buffer }} переполнен, события теряются!
+            Количество за 5 минут: {{ $value | printf "%.0f" }}
+            ДЕЙСТВИЕ: Увеличить размер буфера или уменьшить нагрузку.
+
+      # WARNING: Большой размер очереди в шардах
+      - alert: ShardQueueBacklog
+        expr: |
+          arbitrage_trading_shard_queue_size > 1500
+        for: 1m
+        labels:
+          severity: warning
+          component: shard_processor
+        annotations:
+          summary: "Большой backlog в шарде {{ $labels.shard }}"
+          description: |
+            Очередь в шарде {{ $labels.shard }} достигла {{ $value | printf "%.0f" }} событий.
+            Порог буфера: 2000. При достижении события будут теряться.
+
+      # WARNING: Много горутин
+      - alert: HighGoroutineCount
+        expr: |
+          arbitrage_runtime_goroutines > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: runtime
+        annotations:
+          summary: "Высокое количество горутин"
+          description: |
+            Количество горутин достигло {{ $value | printf "%.0f" }}.
+            Это может указывать на утечку горутин или проблемы с обработкой.
+
+  # ============================================================
+  # Группа: Риск-менеджмент
+  # ============================================================
+  - name: risk_management
+    interval: 30s
+    rules:
+      # CRITICAL: Сработал Stop Loss
+      - alert: StopLossTriggered
+        expr: |
+          increase(arbitrage_risk_stop_loss_triggered_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: risk_manager
+        annotations:
+          summary: "Stop Loss сработал для {{ $labels.symbol }}"
+          description: |
+            Позиция по {{ $labels.symbol }} была закрыта по Stop Loss.
+            Это может указывать на неблагоприятные рыночные условия.
+            Проверьте журнал уведомлений для деталей.
+
+      # CRITICAL: Обнаружена ликвидация
+      - alert: LiquidationDetected
+        expr: |
+          increase(arbitrage_risk_liquidations_detected_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: risk_manager
+        annotations:
+          summary: "ЛИКВИДАЦИЯ на {{ $labels.exchange }} для {{ $labels.symbol }}"
+          description: |
+            Обнаружена ликвидация позиции {{ $labels.symbol }} на бирже {{ $labels.exchange }}.
+            КРИТИЧЕСКОЕ СОБЫТИЕ: Требуется немедленная проверка!
+
+      # WARNING: Много неудачных сделок
+      - alert: HighTradeFailureRate
+        expr: |
+          sum(rate(arbitrage_trading_trades_total{result="failed"}[15m]))
+          /
+          sum(rate(arbitrage_trading_trades_total[15m])) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          component: trading_engine
+        annotations:
+          summary: "Высокий процент неудачных сделок"
+          description: |
+            Более 20% сделок завершаются неудачно за последние 15 минут.
+            Текущий процент ошибок: {{ $value | printf "%.1f" }}%
+            Проверьте подключения к биржам и состояние API.
+
+  # ============================================================
+  # Группа: Состояние бирж
+  # ============================================================
+  - name: exchange_health
+    interval: 30s
+    rules:
+      # CRITICAL: Биржа отключена
+      - alert: ExchangeDisconnected
+        expr: |
+          arbitrage_exchange_connection_status == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: exchange_connector
+        annotations:
+          summary: "Биржа {{ $labels.exchange }} отключена"
+          description: |
+            Потеряно соединение с биржей {{ $labels.exchange }}.
+            Длительность: > 1 минуты.
+            ДЕЙСТВИЕ: Проверить API ключи и доступность биржи.
+
+      # WARNING: Низкий баланс на бирже
+      - alert: LowExchangeBalance
+        expr: |
+          arbitrage_exchange_balance_usdt < 100
+        for: 5m
+        labels:
+          severity: warning
+          component: balance_monitor
+        annotations:
+          summary: "Низкий баланс на {{ $labels.exchange }}"
+          description: |
+            Баланс на бирже {{ $labels.exchange }} ниже $100 USDT.
+            Текущий баланс: ${{ $value | printf "%.2f" }}
+            Возможно недостаточно средств для торговли.
+
+  # ============================================================
+  # Группа: Состояние торговых пар
+  # ============================================================
+  - name: pairs_health
+    interval: 30s
+    rules:
+      # WARNING: Нет активных пар
+      - alert: NoActivePairs
+        expr: |
+          sum(arbitrage_trading_active_pairs{state="ready"}) == 0
+          and
+          sum(arbitrage_trading_active_pairs{state="holding"}) == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: pair_manager
+        annotations:
+          summary: "Нет активных торговых пар"
+          description: |
+            Нет торговых пар в состоянии READY или HOLDING более 5 минут.
+            Бот не выполняет арбитраж.
+
+      # INFO: Много пар в состоянии ERROR
+      - alert: PairsInErrorState
+        expr: |
+          arbitrage_trading_active_pairs{state="error"} > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: pair_manager
+        annotations:
+          summary: "{{ $value | printf "%.0f" }} пар в состоянии ERROR"
+          description: |
+            Обнаружены торговые пары в состоянии ошибки.
+            Количество: {{ $value | printf "%.0f" }}
+            Требуется вмешательство для восстановления.
+
+  # ============================================================
+  # Группа: Арбитражные возможности
+  # ============================================================
+  - name: arbitrage_opportunities
+    interval: 60s
+    rules:
+      # INFO: Низкая частота обнаружения возможностей
+      - alert: LowOpportunityDetection
+        expr: |
+          sum(rate(arbitrage_trading_opportunities_detected_total{triggered="yes"}[1h])) == 0
+        for: 30m
+        labels:
+          severity: info
+          component: arbitrage_detector
+        annotations:
+          summary: "Не обнаружено арбитражных возможностей"
+          description: |
+            За последние 30 минут не было обнаружено арбитражных возможностей,
+            соответствующих условиям входа.
+            Это может быть нормально при низкой волатильности рынка.
+
+      # WARNING: Отрицательный PNL
+      - alert: NegativePnLTrend
+        expr: |
+          increase(arbitrage_trading_pnl_total_usdt[1h]) < -50
+        for: 0s
+        labels:
+          severity: warning
+          component: pnl_monitor
+        annotations:
+          summary: "Отрицательный PNL за последний час"
+          description: |
+            PNL снизился более чем на $50 за последний час.
+            Изменение: ${{ $value | printf "%.2f" }}
+            Рекомендуется проверить настройки торговых пар.
