@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"net/http/pprof"
+	"runtime"
 
 	"arbitrage/internal/api/handlers"
 	"arbitrage/internal/api/middleware"
@@ -9,6 +11,7 @@ import (
 	"arbitrage/internal/websocket"
 
 	"github.com/gorilla/mux"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Dependencies содержит все зависимости для API handlers
@@ -179,5 +182,108 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		w.Write([]byte("OK"))
 	}).Methods("GET")
 
+	// ============================================================
+	// Prometheus metrics endpoint
+	// ============================================================
+	// GET /metrics - экспорт метрик для Prometheus
+	// Используется для мониторинга производительности торгового ядра
+	router.Handle("/metrics", promhttp.Handler()).Methods("GET")
+
+	// ============================================================
+	// pprof endpoints для профилирования
+	// ============================================================
+	// ВАЖНО: В production должны быть защищены авторизацией!
+	// Используются для анализа производительности и отладки:
+	// - /debug/pprof/         - индекс всех профилей
+	// - /debug/pprof/profile  - CPU профиль (30 сек по умолчанию)
+	// - /debug/pprof/heap     - профиль памяти
+	// - /debug/pprof/goroutine - список горутин
+	// - /debug/pprof/trace    - execution trace
+	//
+	// Пример использования:
+	// go tool pprof http://localhost:8080/debug/pprof/profile
+	// go tool pprof http://localhost:8080/debug/pprof/heap
+
+	debug := router.PathPrefix("/debug/pprof").Subrouter()
+
+	debug.HandleFunc("/", pprof.Index)
+	debug.HandleFunc("/cmdline", pprof.Cmdline)
+	debug.HandleFunc("/profile", pprof.Profile)
+	debug.HandleFunc("/symbol", pprof.Symbol)
+	debug.HandleFunc("/trace", pprof.Trace)
+
+	// Handlers для специфичных профилей
+	debug.HandleFunc("/heap", func(w http.ResponseWriter, r *http.Request) {
+		pprof.Handler("heap").ServeHTTP(w, r)
+	})
+	debug.HandleFunc("/goroutine", func(w http.ResponseWriter, r *http.Request) {
+		pprof.Handler("goroutine").ServeHTTP(w, r)
+	})
+	debug.HandleFunc("/block", func(w http.ResponseWriter, r *http.Request) {
+		pprof.Handler("block").ServeHTTP(w, r)
+	})
+	debug.HandleFunc("/threadcreate", func(w http.ResponseWriter, r *http.Request) {
+		pprof.Handler("threadcreate").ServeHTTP(w, r)
+	})
+	debug.HandleFunc("/mutex", func(w http.ResponseWriter, r *http.Request) {
+		pprof.Handler("mutex").ServeHTTP(w, r)
+	})
+	debug.HandleFunc("/allocs", func(w http.ResponseWriter, r *http.Request) {
+		pprof.Handler("allocs").ServeHTTP(w, r)
+	})
+
+	// Runtime stats endpoint (дополнительно)
+	router.HandleFunc("/debug/runtime", func(w http.ResponseWriter, r *http.Request) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{`))
+		w.Write([]byte(`"goroutines":` + itoa(runtime.NumGoroutine()) + `,`))
+		w.Write([]byte(`"heap_alloc_mb":` + ftoa(float64(m.HeapAlloc)/1024/1024) + `,`))
+		w.Write([]byte(`"heap_sys_mb":` + ftoa(float64(m.HeapSys)/1024/1024) + `,`))
+		w.Write([]byte(`"num_gc":` + itoa(int(m.NumGC)) + `,`))
+		w.Write([]byte(`"gc_pause_total_ms":` + ftoa(float64(m.PauseTotalNs)/1e6)))
+		w.Write([]byte(`}`))
+	}).Methods("GET")
+
 	return router
+}
+
+// Вспомогательные функции для JSON без fmt
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	pos := len(b)
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	for i > 0 {
+		pos--
+		b[pos] = byte('0' + i%10)
+		i /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
+	}
+	return string(b[pos:])
+}
+
+func ftoa(f float64) string {
+	// Простое форматирование с 2 знаками после запятой
+	i := int(f * 100)
+	whole := i / 100
+	frac := i % 100
+	if frac < 0 {
+		frac = -frac
+	}
+	fracStr := itoa(frac)
+	if len(fracStr) == 1 {
+		fracStr = "0" + fracStr
+	}
+	return itoa(whole) + "." + fracStr
 }

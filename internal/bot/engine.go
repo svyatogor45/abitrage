@@ -370,11 +370,19 @@ func (e *Engine) executeExit(ps *PairState, reason ExitReason) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
 	defer cancel()
 
+	// МЕТРИКА: засекаем время закрытия
+	exitStart := time.Now()
+
 	// Закрываем через OrderExecutor
 	result := e.orderExec.CloseParallel(ctx, CloseParams{
 		Symbol: ps.Config.Symbol,
 		Legs:   ps.Runtime.Legs,
 	})
+
+	// МЕТРИКА: записываем латентность закрытия
+	exitLatencyMs := float64(time.Since(exitStart).Milliseconds())
+	RecordTickToOrder(ps.Config.Symbol, "exit_execution", exitLatencyMs)
+	EventsProcessed.WithLabelValues("exit").Inc()
 
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -385,6 +393,15 @@ func (e *Engine) executeExit(ps *PairState, reason ExitReason) {
 		ps.Runtime.Legs = nil
 		ps.Runtime.FilledParts = 0
 		e.decrementActiveArbs()
+
+		// МЕТРИКА: записываем успешную сделку
+		RecordTrade(ps.Config.Symbol, "success", result.TotalPnl)
+		UpdateActiveArbitrages(atomic.LoadInt64(&e.activeArbs))
+
+		// МЕТРИКА: записываем стоп-лосс или ликвидацию
+		if reason == ExitReasonStopLoss {
+			StopLossTriggered.WithLabelValues(ps.Config.Symbol).Inc()
+		}
 
 		// Определяем следующее состояние
 		if reason == ExitReasonStopLoss || reason == ExitReasonLiquidation {
@@ -401,6 +418,8 @@ func (e *Engine) executeExit(ps *PairState, reason ExitReason) {
 	} else {
 		// Ошибка закрытия
 		ps.Runtime.State = models.StateError
+		// МЕТРИКА: записываем неудачную сделку
+		RecordTrade(ps.Config.Symbol, "failed", 0)
 		e.notifyError(ps, result.Error)
 	}
 }
@@ -477,12 +496,17 @@ func (e *Engine) routePriceUpdate(exchName, symbol string, bidPrice, askPrice fl
 	default:
 		// Буфер полон - возвращаем в пул и пропускаем
 		releasePriceUpdate(update)
+		// МЕТРИКА: записываем переполнение буфера
+		RecordBufferOverflow("price_shard")
 	}
 }
 
 // handlePriceUpdate - обработка обновления цены
 // Время выполнения: ~0.5-2ms (без сетевых запросов!)
 func (e *Engine) handlePriceUpdate(update *PriceUpdate) {
+	// МЕТРИКА: засекаем время начала обработки
+	startTime := time.Now()
+
 	// 1. Обновляем шардированный трекер цен O(k), k=число бирж
 	e.priceTracker.UpdateFromPtr(update)
 
@@ -493,6 +517,10 @@ func (e *Engine) handlePriceUpdate(update *PriceUpdate) {
 	for _, pairState := range pairs {
 		e.checkArbitrageOpportunity(pairState)
 	}
+
+	// МЕТРИКА: записываем латентность обработки
+	latencyMs := float64(time.Since(startTime).Microseconds()) / 1000.0
+	RecordPriceUpdateLatency(update.Symbol, latencyMs)
 }
 
 // checkArbitrageOpportunity - проверка арбитражной возможности для пары
@@ -543,6 +571,10 @@ func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 	atomic.StoreInt32(&ps.isReady, 0) // Сбрасываем флаг
 	e.incrementActiveArbs()
 
+	// МЕТРИКА: записываем возможность, которая привела к входу
+	RecordOpportunity(ps.Config.Symbol, true)
+	RecordSpread(ps.Config.Symbol, conditions.Opportunity.NetSpread)
+
 	// Асинхронный вход (не блокируем обработку других событий)
 	go e.executeEntryWithConditions(ps, conditions)
 }
@@ -563,6 +595,9 @@ func (e *Engine) shouldEnter(ps *PairState, opp *ArbitrageOpportunity) bool {
 func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryConditions) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
 	defer cancel()
+
+	// МЕТРИКА: засекаем время исполнения входа
+	entryStart := time.Now()
 
 	opp := conditions.Opportunity
 	volume := conditions.AdjustedVolume
@@ -597,6 +632,10 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 		})
 	}
 
+	// МЕТРИКА: записываем латентность исполнения
+	execLatencyMs := float64(time.Since(entryStart).Milliseconds())
+	RecordTickToOrder(ps.Config.Symbol, "entry_execution", execLatencyMs)
+
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -607,6 +646,10 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 		ps.Runtime.FilledParts = 1
 		ps.Runtime.LastUpdate = time.Now()
 
+		// МЕТРИКА: обновляем счётчик активных арбитражей
+		UpdateActiveArbitrages(atomic.LoadInt64(&e.activeArbs))
+		EventsProcessed.WithLabelValues("entry").Inc()
+
 		e.notifyTradeOpened(ps, result)
 	} else {
 		// Ошибка - возврат в готовность
@@ -614,6 +657,9 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
 		atomic.StoreInt32(&ps.isReady, 1)
 		e.decrementActiveArbs()
+
+		// МЕТРИКА: записываем откат
+		RecordTrade(ps.Config.Symbol, "rollback", 0)
 
 		e.notifyError(ps, result.Error)
 	}
