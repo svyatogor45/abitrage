@@ -22,14 +22,23 @@ var (
 	ErrHasActivePositions      = errors.New("cannot disconnect: exchange has active positions")
 )
 
+// BalanceBroadcaster - интерфейс для отправки обновлений балансов через WebSocket
+type BalanceBroadcaster interface {
+	BroadcastBalanceUpdate(exchange string, balance float64)
+	BroadcastAllBalances(balances map[string]float64)
+}
+
 // ExchangeService - бизнес-логика для управления биржами
 type ExchangeService struct {
-	exchangeRepo *repository.ExchangeRepository
-	pairRepo     *repository.PairRepository
+	exchangeRepo  *repository.ExchangeRepository
+	pairRepo      *repository.PairRepository
 	encryptionKey []byte
 
 	// Кэш активных соединений с биржами
 	connections map[string]exchange.Exchange
+
+	// WebSocket hub для broadcast балансов
+	wsHub BalanceBroadcaster
 }
 
 // NewExchangeService создает новый экземпляр сервиса
@@ -44,6 +53,16 @@ func NewExchangeService(
 		encryptionKey: []byte(encryptionKey),
 		connections:   make(map[string]exchange.Exchange),
 	}
+}
+
+// SetWebSocketHub устанавливает WebSocket hub для broadcast балансов.
+//
+// Вызывается после инициализации Hub в main.go:
+//
+//	exchangeService := service.NewExchangeService(...)
+//	exchangeService.SetWebSocketHub(wsHub)
+func (s *ExchangeService) SetWebSocketHub(hub BalanceBroadcaster) {
+	s.wsHub = hub
 }
 
 // ConnectExchange подключает биржу с указанными API ключами
@@ -212,6 +231,7 @@ func (s *ExchangeService) DisconnectExchange(ctx context.Context, name string) e
 
 // UpdateBalance обновляет баланс биржи
 // Запрашивает актуальный баланс через API биржи
+// После успешного обновления отправляет broadcast через WebSocket
 func (s *ExchangeService) UpdateBalance(ctx context.Context, name string) (float64, error) {
 	name = strings.ToLower(name)
 
@@ -251,6 +271,11 @@ func (s *ExchangeService) UpdateBalance(ctx context.Context, name string) (float
 	// 5. Очищаем ошибку если была
 	if account.LastError != "" {
 		_ = s.exchangeRepo.SetLastError(account.ID, "")
+	}
+
+	// 6. Broadcast через WebSocket для real-time обновления UI
+	if s.wsHub != nil {
+		s.wsHub.BroadcastBalanceUpdate(name, balance)
 	}
 
 	return balance, nil
@@ -351,6 +376,7 @@ func (s *ExchangeService) GetConnection(ctx context.Context, name string) (excha
 
 // UpdateAllBalances обновляет балансы всех подключенных бирж
 // Вызывается периодически (каждую минуту) из торгового движка
+// После обновления отправляет broadcast всех балансов через WebSocket
 func (s *ExchangeService) UpdateAllBalances(ctx context.Context) map[string]float64 {
 	result := make(map[string]float64)
 
@@ -366,6 +392,11 @@ func (s *ExchangeService) UpdateAllBalances(ctx context.Context) map[string]floa
 			continue
 		}
 		result[account.Name] = balance
+	}
+
+	// Broadcast всех балансов одним сообщением (для начальной загрузки UI)
+	if s.wsHub != nil && len(result) > 0 {
+		s.wsHub.BroadcastAllBalances(result)
 	}
 
 	return result

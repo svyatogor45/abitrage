@@ -4,6 +4,8 @@ import (
 	"log"
 	"sync"
 
+	"arbitrage/internal/models"
+
 	// ОПТИМИЗАЦИЯ: jsoniter в 3-5x быстрее стандартного encoding/json
 	// При 1000+ сообщений/сек экономит ~2-5ms CPU в секунду
 	jsoniter "github.com/json-iterator/go"
@@ -142,41 +144,47 @@ func (h *Hub) Broadcast(message interface{}) {
 }
 
 // BroadcastPairUpdate отправляет обновление состояния пары
-func (h *Hub) BroadcastPairUpdate(pairID int, data interface{}) {
-	message := map[string]interface{}{
-		"type":    "pairUpdate",
-		"pair_id": pairID,
-		"data":    data,
-	}
-	h.Broadcast(message)
+//
+// Использует типизированное сообщение PairUpdateMessage
+// Отправляется каждую секунду для пар в состоянии HOLDING
+func (h *Hub) BroadcastPairUpdate(pairID int, runtime *models.PairRuntime) {
+	msg := NewPairUpdateMessage(pairID, runtime)
+	h.Broadcast(msg)
 }
 
 // BroadcastNotification отправляет новое уведомление
-func (h *Hub) BroadcastNotification(notification interface{}) {
-	message := map[string]interface{}{
-		"type": "notification",
-		"data": notification,
-	}
-	h.Broadcast(message)
+//
+// Использует типизированное сообщение NotificationMessage
+// Отправляется при событиях: OPEN, CLOSE, SL, LIQUIDATION, ERROR, etc.
+func (h *Hub) BroadcastNotification(notif *models.Notification) {
+	msg := NewNotificationMessage(notif)
+	h.Broadcast(msg)
 }
 
 // BroadcastBalanceUpdate отправляет обновление баланса биржи
+//
+// Использует типизированное сообщение BalanceUpdateMessage
+// Отправляется каждую минуту для каждой подключенной биржи
 func (h *Hub) BroadcastBalanceUpdate(exchange string, balance float64) {
-	message := map[string]interface{}{
-		"type":     "balanceUpdate",
-		"exchange": exchange,
-		"balance":  balance,
-	}
-	h.Broadcast(message)
+	msg := NewBalanceUpdateMessage(exchange, balance)
+	h.Broadcast(msg)
 }
 
 // BroadcastStatsUpdate отправляет обновление статистики
-func (h *Hub) BroadcastStatsUpdate(stats interface{}) {
-	message := map[string]interface{}{
-		"type": "statsUpdate",
-		"data": stats,
-	}
-	h.Broadcast(message)
+//
+// Использует типизированное сообщение StatsUpdateMessage
+// Отправляется после завершения каждой сделки
+func (h *Hub) BroadcastStatsUpdate(stats *models.Stats) {
+	msg := NewStatsUpdateMessage(stats)
+	h.Broadcast(msg)
+}
+
+// BroadcastAllBalances отправляет балансы всех бирж
+//
+// Используется при начальной загрузке frontend или массовом обновлении
+func (h *Hub) BroadcastAllBalances(balances map[string]float64) {
+	msg := NewAllBalancesUpdateMessage(balances)
+	h.Broadcast(msg)
 }
 
 // ClientCount возвращает количество подключенных клиентов
