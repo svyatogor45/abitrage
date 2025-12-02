@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -33,10 +34,9 @@ type Bybit struct {
 
 	httpClient *http.Client
 
-	// WebSocket connections
-	wsPublic   *websocket.Conn
-	wsPrivate  *websocket.Conn
-	wsMu       sync.RWMutex
+	// WebSocket managers с автоматическим переподключением
+	wsPublicManager  *WSReconnectManager
+	wsPrivateManager *WSReconnectManager
 
 	// Callbacks
 	tickerCallbacks   map[string]func(*Ticker)
@@ -490,87 +490,80 @@ func (b *Bybit) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	b.tickerCallbacks[symbol] = callback
 	b.callbackMu.Unlock()
 
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
+	// Создаём WSReconnectManager если ещё не создан
+	if b.wsPublicManager == nil {
+		config := DefaultWSReconnectConfig()
+		b.wsPublicManager = NewWSReconnectManager("bybit-public", bybitWSPublic, config)
 
-	// Подключаемся к WebSocket если еще не подключены
-	if b.wsPublic == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(bybitWSPublic, nil)
-		if err != nil {
+		// Устанавливаем обработчик сообщений
+		b.wsPublicManager.SetOnMessage(b.handlePublicMessage)
+
+		// Устанавливаем callback на подключение для логирования
+		b.wsPublicManager.SetOnConnect(func() {
+			log.Printf("[bybit] Public WebSocket connected")
+		})
+
+		// Устанавливаем callback на отключение
+		b.wsPublicManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[bybit] Public WebSocket disconnected: %v", err)
+			}
+		})
+
+		// Подключаемся
+		if err := b.wsPublicManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		b.wsPublic = conn
-
-		// Запускаем обработчик сообщений
-		go b.handlePublicMessages()
 	}
 
-	// Подписываемся на тикер
+	// Формируем сообщение подписки
 	subMsg := map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{"tickers." + symbol},
 	}
 
-	return b.wsPublic.WriteJSON(subMsg)
+	// Добавляем подписку для восстановления после переподключения
+	b.wsPublicManager.AddSubscription(subMsg)
+
+	// Отправляем подписку
+	return b.wsPublicManager.Send(subMsg)
 }
 
-func (b *Bybit) handlePublicMessages() {
-	for {
-		select {
-		case <-b.closeChan:
-			return
-		default:
-		}
+// handlePublicMessage обрабатывает одно сообщение из публичного WebSocket
+func (b *Bybit) handlePublicMessage(message []byte) {
+	var msg struct {
+		Topic string `json:"topic"`
+		Data  struct {
+			Symbol    string `json:"symbol"`
+			Bid1Price string `json:"bid1Price"`
+			Ask1Price string `json:"ask1Price"`
+			LastPrice string `json:"lastPrice"`
+		} `json:"data"`
+	}
 
-		b.wsMu.RLock()
-		conn := b.wsPublic
-		b.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if strings.HasPrefix(msg.Topic, "tickers.") {
+		symbol := msg.Data.Symbol
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			// Попытка переподключения
-			time.Sleep(time.Second)
-			continue
-		}
+		b.callbackMu.RLock()
+		callback, ok := b.tickerCallbacks[symbol]
+		b.callbackMu.RUnlock()
 
-		var msg struct {
-			Topic string `json:"topic"`
-			Data  struct {
-				Symbol    string `json:"symbol"`
-				Bid1Price string `json:"bid1Price"`
-				Ask1Price string `json:"ask1Price"`
-				LastPrice string `json:"lastPrice"`
-			} `json:"data"`
-		}
+		if ok && callback != nil {
+			bidPrice, _ := strconv.ParseFloat(msg.Data.Bid1Price, 64)
+			askPrice, _ := strconv.ParseFloat(msg.Data.Ask1Price, 64)
+			lastPrice, _ := strconv.ParseFloat(msg.Data.LastPrice, 64)
 
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if strings.HasPrefix(msg.Topic, "tickers.") {
-			symbol := msg.Data.Symbol
-
-			b.callbackMu.RLock()
-			callback, ok := b.tickerCallbacks[symbol]
-			b.callbackMu.RUnlock()
-
-			if ok && callback != nil {
-				bidPrice, _ := strconv.ParseFloat(msg.Data.Bid1Price, 64)
-				askPrice, _ := strconv.ParseFloat(msg.Data.Ask1Price, 64)
-				lastPrice, _ := strconv.ParseFloat(msg.Data.LastPrice, 64)
-
-				callback(&Ticker{
-					Symbol:    symbol,
-					BidPrice:  bidPrice,
-					AskPrice:  askPrice,
-					LastPrice: lastPrice,
-					Timestamp: time.Now(),
-				})
-			}
+			callback(&Ticker{
+				Symbol:    symbol,
+				BidPrice:  bidPrice,
+				AskPrice:  askPrice,
+				LastPrice: lastPrice,
+				Timestamp: time.Now(),
+			})
 		}
 	}
 }
@@ -580,35 +573,46 @@ func (b *Bybit) SubscribePositions(callback func(*Position)) error {
 	b.positionCallback = callback
 	b.callbackMu.Unlock()
 
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
+	// Создаём WSReconnectManager если ещё не создан
+	if b.wsPrivateManager == nil {
+		config := DefaultWSReconnectConfig()
+		b.wsPrivateManager = NewWSReconnectManager("bybit-private", bybitWSPrivate, config)
 
-	// Подключаемся к приватному WebSocket
-	if b.wsPrivate == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(bybitWSPrivate, nil)
-		if err != nil {
+		// Устанавливаем функцию аутентификации
+		b.wsPrivateManager.SetAuthFunc(b.authenticateWebSocket)
+
+		// Устанавливаем обработчик сообщений
+		b.wsPrivateManager.SetOnMessage(b.handlePrivateMessage)
+
+		// Устанавливаем callback на подключение
+		b.wsPrivateManager.SetOnConnect(func() {
+			log.Printf("[bybit] Private WebSocket connected")
+		})
+
+		// Устанавливаем callback на отключение
+		b.wsPrivateManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[bybit] Private WebSocket disconnected: %v", err)
+			}
+		})
+
+		// Подключаемся
+		if err := b.wsPrivateManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to private WebSocket: %w", err)
 		}
-		b.wsPrivate = conn
-
-		// Аутентификация
-		if err := b.authenticateWebSocket(conn); err != nil {
-			conn.Close()
-			b.wsPrivate = nil
-			return err
-		}
-
-		// Запускаем обработчик
-		go b.handlePrivateMessages()
 	}
 
-	// Подписываемся на позиции
+	// Формируем сообщение подписки
 	subMsg := map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{"position"},
 	}
 
-	return b.wsPrivate.WriteJSON(subMsg)
+	// Добавляем подписку для восстановления после переподключения
+	b.wsPrivateManager.AddSubscription(subMsg)
+
+	// Отправляем подписку
+	return b.wsPrivateManager.Send(subMsg)
 }
 
 func (b *Bybit) authenticateWebSocket(conn *websocket.Conn) error {
@@ -627,77 +631,56 @@ func (b *Bybit) authenticateWebSocket(conn *websocket.Conn) error {
 	return conn.WriteJSON(authMsg)
 }
 
-func (b *Bybit) handlePrivateMessages() {
-	for {
-		select {
-		case <-b.closeChan:
-			return
-		default:
-		}
+// handlePrivateMessage обрабатывает одно сообщение из приватного WebSocket
+func (b *Bybit) handlePrivateMessage(message []byte) {
+	var msg struct {
+		Topic string `json:"topic"`
+		Data  []struct {
+			Symbol         string `json:"symbol"`
+			Side           string `json:"side"`
+			Size           string `json:"size"`
+			EntryPrice     string `json:"entryPrice"`
+			MarkPrice      string `json:"markPrice"`
+			Leverage       string `json:"leverage"`
+			UnrealisedPnl  string `json:"unrealisedPnl"`
+			LiqPrice       string `json:"liqPrice"`
+			PositionStatus string `json:"positionStatus"`
+		} `json:"data"`
+	}
 
-		b.wsMu.RLock()
-		conn := b.wsPrivate
-		b.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if msg.Topic == "position" {
+		b.callbackMu.RLock()
+		callback := b.positionCallback
+		b.callbackMu.RUnlock()
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+		if callback != nil {
+			for _, p := range msg.Data {
+				size, _ := strconv.ParseFloat(p.Size, 64)
+				entryPrice, _ := strconv.ParseFloat(p.EntryPrice, 64)
+				markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
+				leverage, _ := strconv.Atoi(p.Leverage)
+				unrealizedPnl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
 
-		var msg struct {
-			Topic string `json:"topic"`
-			Data  []struct {
-				Symbol        string `json:"symbol"`
-				Side          string `json:"side"`
-				Size          string `json:"size"`
-				EntryPrice    string `json:"entryPrice"`
-				MarkPrice     string `json:"markPrice"`
-				Leverage      string `json:"leverage"`
-				UnrealisedPnl string `json:"unrealisedPnl"`
-				LiqPrice      string `json:"liqPrice"`
-				PositionStatus string `json:"positionStatus"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if msg.Topic == "position" {
-			b.callbackMu.RLock()
-			callback := b.positionCallback
-			b.callbackMu.RUnlock()
-
-			if callback != nil {
-				for _, p := range msg.Data {
-					size, _ := strconv.ParseFloat(p.Size, 64)
-					entryPrice, _ := strconv.ParseFloat(p.EntryPrice, 64)
-					markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-					leverage, _ := strconv.Atoi(p.Leverage)
-					unrealizedPnl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
-
-					side := SideLong
-					if p.Side == "Sell" {
-						side = SideShort
-					}
-
-					callback(&Position{
-						Symbol:        p.Symbol,
-						Side:          side,
-						Size:          size,
-						EntryPrice:    entryPrice,
-						MarkPrice:     markPrice,
-						Leverage:      leverage,
-						UnrealizedPnl: unrealizedPnl,
-						Liquidation:   p.PositionStatus == "Liq",
-						UpdatedAt:     time.Now(),
-					})
+				side := SideLong
+				if p.Side == "Sell" {
+					side = SideShort
 				}
+
+				callback(&Position{
+					Symbol:        p.Symbol,
+					Side:          side,
+					Size:          size,
+					EntryPrice:    entryPrice,
+					MarkPrice:     markPrice,
+					Leverage:      leverage,
+					UnrealizedPnl: unrealizedPnl,
+					Liquidation:   p.PositionStatus == "Liq",
+					UpdatedAt:     time.Now(),
+				})
 			}
 		}
 	}
@@ -792,19 +775,23 @@ func (b *Bybit) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 }
 
 func (b *Bybit) Close() error {
-	close(b.closeChan)
-
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
-
-	if b.wsPublic != nil {
-		b.wsPublic.Close()
-		b.wsPublic = nil
+	// Закрываем closeChan только если он ещё не закрыт
+	select {
+	case <-b.closeChan:
+		// Уже закрыт
+	default:
+		close(b.closeChan)
 	}
 
-	if b.wsPrivate != nil {
-		b.wsPrivate.Close()
-		b.wsPrivate = nil
+	// Закрываем WebSocket managers
+	if b.wsPublicManager != nil {
+		b.wsPublicManager.Close()
+		b.wsPublicManager = nil
+	}
+
+	if b.wsPrivateManager != nil {
+		b.wsPrivateManager.Close()
+		b.wsPrivateManager = nil
 	}
 
 	b.connected = false

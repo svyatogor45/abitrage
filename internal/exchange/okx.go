@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -31,9 +32,9 @@ type OKX struct {
 
 	httpClient *http.Client
 
-	wsPublic  *websocket.Conn
-	wsPrivate *websocket.Conn
-	wsMu      sync.RWMutex
+	// WebSocket managers с автоматическим переподключением
+	wsPublicManager  *WSReconnectManager
+	wsPrivateManager *WSReconnectManager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -504,16 +505,23 @@ func (o *OKX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	o.tickerCallbacks[symbol] = callback
 	o.callbackMu.Unlock()
 
-	o.wsMu.Lock()
-	defer o.wsMu.Unlock()
+	if o.wsPublicManager == nil {
+		config := DefaultWSReconnectConfig()
+		o.wsPublicManager = NewWSReconnectManager("okx-public", okxWSPublic, config)
 
-	if o.wsPublic == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(okxWSPublic, nil)
-		if err != nil {
+		o.wsPublicManager.SetOnMessage(o.handlePublicMessage)
+		o.wsPublicManager.SetOnConnect(func() {
+			log.Printf("[okx] Public WebSocket connected")
+		})
+		o.wsPublicManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[okx] Public WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := o.wsPublicManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		o.wsPublic = conn
-		go o.handlePublicMessages()
 	}
 
 	instId := o.toOKXSymbol(symbol)
@@ -527,70 +535,50 @@ func (o *OKX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		},
 	}
 
-	return o.wsPublic.WriteJSON(subMsg)
+	o.wsPublicManager.AddSubscription(subMsg)
+	return o.wsPublicManager.Send(subMsg)
 }
 
-func (o *OKX) handlePublicMessages() {
-	for {
-		select {
-		case <-o.closeChan:
-			return
-		default:
-		}
+// handlePublicMessage обрабатывает одно сообщение из публичного WebSocket
+func (o *OKX) handlePublicMessage(message []byte) {
+	var msg struct {
+		Arg struct {
+			Channel string `json:"channel"`
+			InstId  string `json:"instId"`
+		} `json:"arg"`
+		Data []struct {
+			BidPx string `json:"bidPx"`
+			AskPx string `json:"askPx"`
+			Last  string `json:"last"`
+			Ts    string `json:"ts"`
+		} `json:"data"`
+	}
 
-		o.wsMu.RLock()
-		conn := o.wsPublic
-		o.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if msg.Arg.Channel == "tickers" && len(msg.Data) > 0 {
+		symbol := o.fromOKXSymbol(msg.Arg.InstId)
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+		o.callbackMu.RLock()
+		callback, ok := o.tickerCallbacks[symbol]
+		o.callbackMu.RUnlock()
 
-		var msg struct {
-			Arg struct {
-				Channel string `json:"channel"`
-				InstId  string `json:"instId"`
-			} `json:"arg"`
-			Data []struct {
-				BidPx string `json:"bidPx"`
-				AskPx string `json:"askPx"`
-				Last  string `json:"last"`
-				Ts    string `json:"ts"`
-			} `json:"data"`
-		}
+		if ok && callback != nil {
+			d := msg.Data[0]
+			bidPrice, _ := strconv.ParseFloat(d.BidPx, 64)
+			askPrice, _ := strconv.ParseFloat(d.AskPx, 64)
+			lastPrice, _ := strconv.ParseFloat(d.Last, 64)
+			ts, _ := strconv.ParseInt(d.Ts, 10, 64)
 
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if msg.Arg.Channel == "tickers" && len(msg.Data) > 0 {
-			symbol := o.fromOKXSymbol(msg.Arg.InstId)
-
-			o.callbackMu.RLock()
-			callback, ok := o.tickerCallbacks[symbol]
-			o.callbackMu.RUnlock()
-
-			if ok && callback != nil {
-				d := msg.Data[0]
-				bidPrice, _ := strconv.ParseFloat(d.BidPx, 64)
-				askPrice, _ := strconv.ParseFloat(d.AskPx, 64)
-				lastPrice, _ := strconv.ParseFloat(d.Last, 64)
-				ts, _ := strconv.ParseInt(d.Ts, 10, 64)
-
-				callback(&Ticker{
-					Symbol:    symbol,
-					BidPrice:  bidPrice,
-					AskPrice:  askPrice,
-					LastPrice: lastPrice,
-					Timestamp: time.UnixMilli(ts),
-				})
-			}
+			callback(&Ticker{
+				Symbol:    symbol,
+				BidPrice:  bidPrice,
+				AskPrice:  askPrice,
+				LastPrice: lastPrice,
+				Timestamp: time.UnixMilli(ts),
+			})
 		}
 	}
 }
@@ -600,23 +588,24 @@ func (o *OKX) SubscribePositions(callback func(*Position)) error {
 	o.positionCallback = callback
 	o.callbackMu.Unlock()
 
-	o.wsMu.Lock()
-	defer o.wsMu.Unlock()
+	if o.wsPrivateManager == nil {
+		config := DefaultWSReconnectConfig()
+		o.wsPrivateManager = NewWSReconnectManager("okx-private", okxWSPrivate, config)
 
-	if o.wsPrivate == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(okxWSPrivate, nil)
-		if err != nil {
+		o.wsPrivateManager.SetAuthFunc(o.authenticateWebSocket)
+		o.wsPrivateManager.SetOnMessage(o.handlePrivateMessage)
+		o.wsPrivateManager.SetOnConnect(func() {
+			log.Printf("[okx] Private WebSocket connected")
+		})
+		o.wsPrivateManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[okx] Private WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := o.wsPrivateManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to private WebSocket: %w", err)
 		}
-		o.wsPrivate = conn
-
-		if err := o.authenticateWebSocket(conn); err != nil {
-			conn.Close()
-			o.wsPrivate = nil
-			return err
-		}
-
-		go o.handlePrivateMessages()
 	}
 
 	subMsg := map[string]interface{}{
@@ -629,7 +618,8 @@ func (o *OKX) SubscribePositions(callback func(*Position)) error {
 		},
 	}
 
-	return o.wsPrivate.WriteJSON(subMsg)
+	o.wsPrivateManager.AddSubscription(subMsg)
+	return o.wsPrivateManager.Send(subMsg)
 }
 
 func (o *OKX) authenticateWebSocket(conn *websocket.Conn) error {
@@ -675,82 +665,61 @@ func (o *OKX) authenticateWebSocket(conn *websocket.Conn) error {
 	return nil
 }
 
-func (o *OKX) handlePrivateMessages() {
-	for {
-		select {
-		case <-o.closeChan:
-			return
-		default:
-		}
+// handlePrivateMessage обрабатывает одно сообщение из приватного WebSocket
+func (o *OKX) handlePrivateMessage(message []byte) {
+	var msg struct {
+		Arg struct {
+			Channel string `json:"channel"`
+		} `json:"arg"`
+		Data []struct {
+			InstId  string `json:"instId"`
+			PosSide string `json:"posSide"`
+			Pos     string `json:"pos"`
+			AvgPx   string `json:"avgPx"`
+			MarkPx  string `json:"markPx"`
+			Lever   string `json:"lever"`
+			Upl     string `json:"upl"`
+			UTime   string `json:"uTime"`
+		} `json:"data"`
+	}
 
-		o.wsMu.RLock()
-		conn := o.wsPrivate
-		o.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if msg.Arg.Channel == "positions" {
+		o.callbackMu.RLock()
+		callback := o.positionCallback
+		o.callbackMu.RUnlock()
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+		if callback != nil {
+			for _, p := range msg.Data {
+				pos, _ := strconv.ParseFloat(p.Pos, 64)
+				entryPrice, _ := strconv.ParseFloat(p.AvgPx, 64)
+				markPrice, _ := strconv.ParseFloat(p.MarkPx, 64)
+				leverage, _ := strconv.Atoi(p.Lever)
+				unrealizedPnl, _ := strconv.ParseFloat(p.Upl, 64)
+				uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
 
-		var msg struct {
-			Arg struct {
-				Channel string `json:"channel"`
-			} `json:"arg"`
-			Data []struct {
-				InstId  string `json:"instId"`
-				PosSide string `json:"posSide"`
-				Pos     string `json:"pos"`
-				AvgPx   string `json:"avgPx"`
-				MarkPx  string `json:"markPx"`
-				Lever   string `json:"lever"`
-				Upl     string `json:"upl"`
-				UTime   string `json:"uTime"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if msg.Arg.Channel == "positions" {
-			o.callbackMu.RLock()
-			callback := o.positionCallback
-			o.callbackMu.RUnlock()
-
-			if callback != nil {
-				for _, p := range msg.Data {
-					pos, _ := strconv.ParseFloat(p.Pos, 64)
-					entryPrice, _ := strconv.ParseFloat(p.AvgPx, 64)
-					markPrice, _ := strconv.ParseFloat(p.MarkPx, 64)
-					leverage, _ := strconv.Atoi(p.Lever)
-					unrealizedPnl, _ := strconv.ParseFloat(p.Upl, 64)
-					uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
-
-					side := SideLong
-					if p.PosSide == "short" {
-						side = SideShort
-						if pos < 0 {
-							pos = -pos
-						}
+				side := SideLong
+				if p.PosSide == "short" {
+					side = SideShort
+					if pos < 0 {
+						pos = -pos
 					}
-
-					callback(&Position{
-						Symbol:        o.fromOKXSymbol(p.InstId),
-						Side:          side,
-						Size:          pos,
-						EntryPrice:    entryPrice,
-						MarkPrice:     markPrice,
-						Leverage:      leverage,
-						UnrealizedPnl: unrealizedPnl,
-						Liquidation:   false,
-						UpdatedAt:     time.UnixMilli(uTime),
-					})
 				}
+
+				callback(&Position{
+					Symbol:        o.fromOKXSymbol(p.InstId),
+					Side:          side,
+					Size:          pos,
+					EntryPrice:    entryPrice,
+					MarkPrice:     markPrice,
+					Leverage:      leverage,
+					UnrealizedPnl: unrealizedPnl,
+					Liquidation:   false,
+					UpdatedAt:     time.UnixMilli(uTime),
+				})
 			}
 		}
 	}
@@ -812,19 +781,20 @@ func (o *OKX) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 }
 
 func (o *OKX) Close() error {
-	close(o.closeChan)
-
-	o.wsMu.Lock()
-	defer o.wsMu.Unlock()
-
-	if o.wsPublic != nil {
-		o.wsPublic.Close()
-		o.wsPublic = nil
+	select {
+	case <-o.closeChan:
+	default:
+		close(o.closeChan)
 	}
 
-	if o.wsPrivate != nil {
-		o.wsPrivate.Close()
-		o.wsPrivate = nil
+	if o.wsPublicManager != nil {
+		o.wsPublicManager.Close()
+		o.wsPublicManager = nil
+	}
+
+	if o.wsPrivateManager != nil {
+		o.wsPrivateManager.Close()
+		o.wsPrivateManager = nil
 	}
 
 	o.connected = false
