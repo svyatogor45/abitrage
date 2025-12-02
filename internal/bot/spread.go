@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -465,4 +466,493 @@ func (sc *SpreadCalculator) CalculatePnl(
 	pnlShort := (shortEntryPrice - shortPrice.AskPrice) * volume
 
 	return pnlLong + pnlShort
+}
+
+// ============================================================
+// OrderBookAnalyzer - анализ стакана ордеров
+// ============================================================
+//
+// Согласно ТЗ раздел "Проверка глубины рынка (ликвидности)":
+// - Анализ стакана ордеров (Level 2) - 5 уровней глубины
+// - Суммирование объёма до достижения требуемого объёма
+// - Расчёт средневзвешенной цены (VWAP)
+// - Моделирование исполнения рыночного ордера
+// - Оценка slippage
+
+// OrderBookAnalyzer анализирует стаканы ордеров для оценки ликвидности
+type OrderBookAnalyzer struct {
+	// Кэш стаканов по биржам (обновляется через WebSocket)
+	// Key: OrderBookKey{Symbol, Exchange}
+	orderBooks sync.Map
+
+	// Глубина анализа (количество уровней)
+	depth int
+
+	// Максимальное время актуальности стакана
+	maxAge time.Duration
+}
+
+// OrderBookKey - ключ для кэша стаканов
+type OrderBookKey struct {
+	Symbol   string
+	Exchange string
+}
+
+// CachedOrderBook - кэшированный стакан с timestamp
+type CachedOrderBook struct {
+	Bids      []PriceLevel // заявки на покупку (от высокой к низкой)
+	Asks      []PriceLevel // заявки на продажу (от низкой к высокой)
+	Timestamp time.Time
+}
+
+// PriceLevel - уровень цены в стакане
+type PriceLevel struct {
+	Price  float64
+	Volume float64
+}
+
+// ExecutionSimulation - результат моделирования исполнения
+type ExecutionSimulation struct {
+	// Средневзвешенная цена исполнения (VWAP)
+	AvgPrice float64
+
+	// Сколько объёма реально можно исполнить
+	FillableVolume float64
+
+	// Slippage относительно лучшей цены (в %)
+	Slippage float64
+
+	// Достаточно ли ликвидности для полного объёма
+	FullyFillable bool
+
+	// Количество использованных уровней
+	LevelsUsed int
+}
+
+// LiquidityAnalysis - полный анализ ликвидности для арбитража
+type LiquidityAnalysis struct {
+	Symbol string
+	Volume float64 // запрошенный объём
+
+	// Анализ для лонга (покупка по Ask)
+	LongExchange  string
+	LongSimulation *ExecutionSimulation
+
+	// Анализ для шорта (продажа по Bid)
+	ShortExchange  string
+	ShortSimulation *ExecutionSimulation
+
+	// Итоговые показатели
+	IsLiquidityOK   bool    // достаточно ликвидности на обеих биржах
+	AdjustedSpread  float64 // спред с учётом slippage (%)
+	EstimatedProfit float64 // примерная прибыль в USDT
+
+	// Предупреждения
+	Warnings []string
+}
+
+// NewOrderBookAnalyzer создаёт анализатор стаканов
+// depth - количество уровней для анализа (по умолчанию 5)
+// maxAge - максимальный возраст данных (по умолчанию 5 секунд)
+func NewOrderBookAnalyzer(depth int, maxAge time.Duration) *OrderBookAnalyzer {
+	if depth <= 0 {
+		depth = 5 // по умолчанию 5 уровней согласно ТЗ
+	}
+	if maxAge <= 0 {
+		maxAge = 5 * time.Second
+	}
+
+	return &OrderBookAnalyzer{
+		depth:  depth,
+		maxAge: maxAge,
+	}
+}
+
+// UpdateOrderBook обновляет кэшированный стакан
+// Вызывается из WebSocket обработчика при получении данных
+func (oba *OrderBookAnalyzer) UpdateOrderBook(symbol, exchange string, bids, asks []PriceLevel) {
+	key := OrderBookKey{Symbol: symbol, Exchange: exchange}
+
+	// Ограничиваем глубину
+	if len(bids) > oba.depth {
+		bids = bids[:oba.depth]
+	}
+	if len(asks) > oba.depth {
+		asks = asks[:oba.depth]
+	}
+
+	cached := &CachedOrderBook{
+		Bids:      bids,
+		Asks:      asks,
+		Timestamp: time.Now(),
+	}
+
+	oba.orderBooks.Store(key, cached)
+}
+
+// GetOrderBook возвращает кэшированный стакан (если актуален)
+func (oba *OrderBookAnalyzer) GetOrderBook(symbol, exchange string) *CachedOrderBook {
+	key := OrderBookKey{Symbol: symbol, Exchange: exchange}
+
+	if v, ok := oba.orderBooks.Load(key); ok {
+		cached := v.(*CachedOrderBook)
+		// Проверяем актуальность
+		if time.Since(cached.Timestamp) <= oba.maxAge {
+			return cached
+		}
+	}
+	return nil
+}
+
+// SimulateBuy моделирует покупку (market buy) заданного объёма
+// Проходит по Ask уровням от лучшей цены вверх
+//
+// Возвращает:
+// - Средневзвешенную цену покупки (VWAP)
+// - Slippage относительно лучшего Ask
+// - Можно ли исполнить весь объём
+func (oba *OrderBookAnalyzer) SimulateBuy(symbol, exchange string, volume float64) *ExecutionSimulation {
+	ob := oba.GetOrderBook(symbol, exchange)
+	if ob == nil || len(ob.Asks) == 0 {
+		return nil
+	}
+
+	return oba.simulateMarketOrder(ob.Asks, volume, true)
+}
+
+// SimulateSell моделирует продажу (market sell) заданного объёма
+// Проходит по Bid уровням от лучшей цены вниз
+//
+// Возвращает:
+// - Средневзвешенную цену продажи (VWAP)
+// - Slippage относительно лучшего Bid
+// - Можно ли исполнить весь объём
+func (oba *OrderBookAnalyzer) SimulateSell(symbol, exchange string, volume float64) *ExecutionSimulation {
+	ob := oba.GetOrderBook(symbol, exchange)
+	if ob == nil || len(ob.Bids) == 0 {
+		return nil
+	}
+
+	return oba.simulateMarketOrder(ob.Bids, volume, false)
+}
+
+// simulateMarketOrder общая логика моделирования исполнения
+// isBuy: true = покупка (идём по Asks), false = продажа (идём по Bids)
+func (oba *OrderBookAnalyzer) simulateMarketOrder(levels []PriceLevel, volume float64, isBuy bool) *ExecutionSimulation {
+	if len(levels) == 0 || volume <= 0 {
+		return nil
+	}
+
+	result := &ExecutionSimulation{}
+
+	bestPrice := levels[0].Price
+	var totalCost float64    // сумма (price × volume) для VWAP
+	var filledVolume float64 // исполненный объём
+	remainingVolume := volume
+
+	// Проходим по уровням стакана
+	for i, level := range levels {
+		if remainingVolume <= 0 {
+			break
+		}
+
+		result.LevelsUsed = i + 1
+
+		// Сколько можем взять с этого уровня
+		takeVolume := level.Volume
+		if takeVolume > remainingVolume {
+			takeVolume = remainingVolume
+		}
+
+		// Накапливаем для VWAP
+		totalCost += level.Price * takeVolume
+		filledVolume += takeVolume
+		remainingVolume -= takeVolume
+	}
+
+	// Рассчитываем результаты
+	if filledVolume > 0 {
+		result.AvgPrice = totalCost / filledVolume
+		result.FillableVolume = filledVolume
+		result.FullyFillable = remainingVolume <= 0
+
+		// Slippage: разница между VWAP и лучшей ценой
+		if isBuy {
+			// Для покупки: slippage положительный если VWAP > bestAsk
+			result.Slippage = (result.AvgPrice - bestPrice) / bestPrice * 100
+		} else {
+			// Для продажи: slippage положительный если VWAP < bestBid
+			result.Slippage = (bestPrice - result.AvgPrice) / bestPrice * 100
+		}
+	}
+
+	return result
+}
+
+// AnalyzeLiquidity выполняет полный анализ ликвидности для арбитража
+//
+// Согласно ТЗ:
+// - На дешёвой бирже (long): проходим по Asks, считаем VWAP для покупки
+// - На дорогой бирже (short): проходим по Bids, считаем VWAP для продажи
+// - Рассчитываем реальный спред с учётом slippage
+func (oba *OrderBookAnalyzer) AnalyzeLiquidity(
+	symbol string,
+	volume float64,
+	longExchange string,  // биржа для лонга (покупка)
+	shortExchange string, // биржа для шорта (продажа)
+) *LiquidityAnalysis {
+	analysis := &LiquidityAnalysis{
+		Symbol:        symbol,
+		Volume:        volume,
+		LongExchange:  longExchange,
+		ShortExchange: shortExchange,
+		Warnings:      make([]string, 0),
+	}
+
+	// Моделируем покупку на бирже для лонга
+	analysis.LongSimulation = oba.SimulateBuy(symbol, longExchange, volume)
+	if analysis.LongSimulation == nil {
+		analysis.Warnings = append(analysis.Warnings,
+			"no orderbook data for "+longExchange)
+		return analysis
+	}
+
+	// Моделируем продажу на бирже для шорта
+	analysis.ShortSimulation = oba.SimulateSell(symbol, shortExchange, volume)
+	if analysis.ShortSimulation == nil {
+		analysis.Warnings = append(analysis.Warnings,
+			"no orderbook data for "+shortExchange)
+		return analysis
+	}
+
+	// Проверяем достаточность ликвидности
+	longOK := analysis.LongSimulation.FullyFillable
+	shortOK := analysis.ShortSimulation.FullyFillable
+	analysis.IsLiquidityOK = longOK && shortOK
+
+	if !longOK {
+		analysis.Warnings = append(analysis.Warnings,
+			"insufficient liquidity on "+longExchange+
+				" (available: "+formatVolume(analysis.LongSimulation.FillableVolume)+")")
+	}
+	if !shortOK {
+		analysis.Warnings = append(analysis.Warnings,
+			"insufficient liquidity on "+shortExchange+
+				" (available: "+formatVolume(analysis.ShortSimulation.FillableVolume)+")")
+	}
+
+	// Рассчитываем реальный спред с учётом VWAP
+	// Спред = (VWAP_sell - VWAP_buy) / VWAP_buy × 100
+	if analysis.LongSimulation.AvgPrice > 0 {
+		analysis.AdjustedSpread = (analysis.ShortSimulation.AvgPrice -
+			analysis.LongSimulation.AvgPrice) / analysis.LongSimulation.AvgPrice * 100
+
+		// Примерная прибыль (без учёта комиссий)
+		analysis.EstimatedProfit = (analysis.ShortSimulation.AvgPrice -
+			analysis.LongSimulation.AvgPrice) * volume
+	}
+
+	// Предупреждение о высоком slippage
+	totalSlippage := analysis.LongSimulation.Slippage + analysis.ShortSimulation.Slippage
+	if totalSlippage > 0.1 { // > 0.1%
+		analysis.Warnings = append(analysis.Warnings,
+			"high total slippage: "+formatPercent(totalSlippage))
+	}
+
+	return analysis
+}
+
+// CheckLiquidityForVolume проверяет достаточность ликвидности
+// Быстрая проверка без полного анализа
+func (oba *OrderBookAnalyzer) CheckLiquidityForVolume(
+	symbol string,
+	volume float64,
+	longExchange string,
+	shortExchange string,
+) (bool, string) {
+	// Проверяем ликвидность для покупки (long)
+	longSim := oba.SimulateBuy(symbol, longExchange, volume)
+	if longSim == nil {
+		return false, "no orderbook for " + longExchange
+	}
+	if !longSim.FullyFillable {
+		return false, "insufficient liquidity on " + longExchange
+	}
+
+	// Проверяем ликвидность для продажи (short)
+	shortSim := oba.SimulateSell(symbol, shortExchange, volume)
+	if shortSim == nil {
+		return false, "no orderbook for " + shortExchange
+	}
+	if !shortSim.FullyFillable {
+		return false, "insufficient liquidity on " + shortExchange
+	}
+
+	return true, ""
+}
+
+// GetRealSpread рассчитывает реальный спред с учётом объёма и slippage
+// Используется вместо GetBestOpportunity когда важна точность
+func (sc *SpreadCalculator) GetRealSpread(
+	symbol string,
+	volume float64,
+	orderBookAnalyzer *OrderBookAnalyzer,
+) *ArbitrageOpportunity {
+	// Сначала получаем базовую возможность (лучшие цены)
+	best := sc.tracker.GetBestPrices(symbol)
+	if best == nil || best.BestAskExch == best.BestBidExch || best.RawSpread <= 0 {
+		return nil
+	}
+
+	// Анализируем ликвидность
+	analysis := orderBookAnalyzer.AnalyzeLiquidity(
+		symbol, volume, best.BestAskExch, best.BestBidExch)
+
+	if analysis == nil || !analysis.IsLiquidityOK {
+		return nil
+	}
+
+	// Рассчитываем чистый спред с учётом slippage и комиссий
+	adjustedSpread := analysis.AdjustedSpread
+
+	// Вычитаем комиссии
+	sc.feesMu.RLock()
+	feeLong := sc.fees[best.BestAskExch]
+	feeShort := sc.fees[best.BestBidExch]
+	sc.feesMu.RUnlock()
+
+	if feeLong == 0 {
+		feeLong = 0.0005
+	}
+	if feeShort == 0 {
+		feeShort = 0.0005
+	}
+
+	totalFees := 2 * (feeLong + feeShort) * 100
+	netSpread := adjustedSpread - totalFees
+
+	return &ArbitrageOpportunity{
+		Symbol:        symbol,
+		LongExchange:  best.BestAskExch,
+		LongPrice:     analysis.LongSimulation.AvgPrice, // VWAP вместо лучшей цены
+		ShortExchange: best.BestBidExch,
+		ShortPrice:    analysis.ShortSimulation.AvgPrice, // VWAP вместо лучшей цены
+		RawSpread:     adjustedSpread,                    // спред с учётом slippage
+		NetSpread:     netSpread,                         // минус комиссии
+		Timestamp:     best.BestAskTime,
+	}
+}
+
+// ============================================================
+// Вспомогательные функции форматирования
+// ============================================================
+
+func formatVolume(v float64) string {
+	if v >= 1 {
+		return fmt.Sprintf("%.4f", v)
+	}
+	return fmt.Sprintf("%.8f", v)
+}
+
+func formatPercent(p float64) string {
+	return fmt.Sprintf("%.4f%%", p)
+}
+
+// ============================================================
+// Расширение SpreadCalculator для работы с OrderBookAnalyzer
+// ============================================================
+
+// SpreadWithLiquidity - расширенная информация о спреде
+type SpreadWithLiquidity struct {
+	*ArbitrageOpportunity
+
+	// Данные о ликвидности
+	LongSlippage   float64 // slippage при покупке (%)
+	ShortSlippage  float64 // slippage при продаже (%)
+	TotalSlippage  float64 // суммарный slippage (%)
+	IsLiquidityOK  bool    // достаточно ликвидности
+	LiquidityIssue string  // описание проблемы (если есть)
+}
+
+// GetSpreadWithLiquidity возвращает спред с учётом ликвидности
+func (sc *SpreadCalculator) GetSpreadWithLiquidity(
+	symbol string,
+	volume float64,
+	orderBookAnalyzer *OrderBookAnalyzer,
+) *SpreadWithLiquidity {
+	// Базовая возможность
+	opp := sc.GetBestOpportunity(symbol)
+	if opp == nil {
+		return nil
+	}
+
+	result := &SpreadWithLiquidity{
+		ArbitrageOpportunity: opp,
+		IsLiquidityOK:        true,
+	}
+
+	// Если нет анализатора стаканов - возвращаем базовые данные
+	if orderBookAnalyzer == nil {
+		return result
+	}
+
+	// Проверяем ликвидность
+	ok, issue := orderBookAnalyzer.CheckLiquidityForVolume(
+		symbol, volume, opp.LongExchange, opp.ShortExchange)
+
+	result.IsLiquidityOK = ok
+	result.LiquidityIssue = issue
+
+	if !ok {
+		return result
+	}
+
+	// Получаем детальный анализ для slippage
+	longSim := orderBookAnalyzer.SimulateBuy(symbol, opp.LongExchange, volume)
+	shortSim := orderBookAnalyzer.SimulateSell(symbol, opp.ShortExchange, volume)
+
+	if longSim != nil {
+		result.LongSlippage = longSim.Slippage
+		// Обновляем цену на VWAP
+		opp.LongPrice = longSim.AvgPrice
+	}
+
+	if shortSim != nil {
+		result.ShortSlippage = shortSim.Slippage
+		// Обновляем цену на VWAP
+		opp.ShortPrice = shortSim.AvgPrice
+	}
+
+	result.TotalSlippage = result.LongSlippage + result.ShortSlippage
+
+	// Пересчитываем спред с VWAP ценами
+	if opp.LongPrice > 0 {
+		opp.RawSpread = (opp.ShortPrice - opp.LongPrice) / opp.LongPrice * 100
+		opp.NetSpread = sc.calculateNetSpreadFromPrices(
+			opp.RawSpread, opp.LongExchange, opp.ShortExchange)
+	}
+
+	return result
+}
+
+// calculateNetSpreadFromPrices вычисляет чистый спред для заданных бирж
+func (sc *SpreadCalculator) calculateNetSpreadFromPrices(
+	rawSpread float64,
+	longExchange string,
+	shortExchange string,
+) float64 {
+	sc.feesMu.RLock()
+	feeLong := sc.fees[longExchange]
+	feeShort := sc.fees[shortExchange]
+	sc.feesMu.RUnlock()
+
+	if feeLong == 0 {
+		feeLong = 0.0005
+	}
+	if feeShort == 0 {
+		feeShort = 0.0005
+	}
+
+	totalFees := 2 * (feeLong + feeShort) * 100
+	return rawSpread - totalFees
 }

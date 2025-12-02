@@ -3,11 +3,14 @@ package bot
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"arbitrage/internal/config"
 	"arbitrage/internal/exchange"
 	"arbitrage/internal/models"
+	"arbitrage/pkg/retry"
 )
 
 // ============ ОПТИМИЗАЦИЯ: Object Pool для каналов LegResult ============
@@ -354,4 +357,410 @@ func (oe *OrderExecutor) UpdateExchanges(exchanges map[string]exchange.Exchange)
 	oe.mu.Lock()
 	oe.exchanges = exchanges
 	oe.mu.Unlock()
+}
+
+// ============================================================
+// OrderValidator - валидация ордеров согласно лимитам биржи
+// ============================================================
+//
+// Согласно ТЗ раздел "Проверка маржи и лимитов перед входом":
+// - Проверка минимального/максимального размера ордера
+// - Округление объёмов до lot size биржи
+// - Проверка min notional (минимальная сумма сделки в USDT)
+// - Предотвращение отклонения ордеров биржей
+
+// OrderValidator проверяет и корректирует параметры ордеров
+type OrderValidator struct {
+	// Кэш лимитов по биржам и символам
+	// Key: LimitsKey{Exchange, Symbol}
+	limits sync.Map
+
+	// Кэш текущих цен для расчёта notional
+	priceGetter func(symbol, exchange string) float64
+
+	// Дефолтные значения если лимиты не загружены
+	defaultMinQty    float64
+	defaultMaxQty    float64
+	defaultQtyStep   float64
+	defaultMinNotional float64
+}
+
+// LimitsKey - ключ для кэша лимитов
+type LimitsKey struct {
+	Exchange string
+	Symbol   string
+}
+
+// CachedLimits - кэшированные лимиты с timestamp
+type CachedLimits struct {
+	MinOrderQty  float64
+	MaxOrderQty  float64
+	QtyStep      float64 // lot size
+	MinNotional  float64
+	PriceStep    float64 // tick size
+	MaxLeverage  int
+	UpdatedAt    time.Time
+}
+
+// ValidationResult - результат валидации
+type ValidationResult struct {
+	Valid        bool
+	AdjustedQty  float64 // скорректированный объём
+	Error        string  // описание ошибки если Invalid
+	Warnings     []string
+}
+
+// NewOrderValidator создаёт валидатор ордеров
+func NewOrderValidator(priceGetter func(symbol, exchange string) float64) *OrderValidator {
+	return &OrderValidator{
+		priceGetter:      priceGetter,
+		defaultMinQty:    0.001,    // 0.001 BTC
+		defaultMaxQty:    1000.0,   // 1000 BTC
+		defaultQtyStep:   0.001,    // 0.001 BTC
+		defaultMinNotional: 5.0,    // 5 USDT минимальная сумма
+	}
+}
+
+// UpdateLimits обновляет кэшированные лимиты для пары биржа+символ
+func (ov *OrderValidator) UpdateLimits(exchangeName, symbol string, limits *exchange.Limits) {
+	if limits == nil {
+		return
+	}
+
+	key := LimitsKey{Exchange: exchangeName, Symbol: symbol}
+	cached := &CachedLimits{
+		MinOrderQty:  limits.MinOrderQty,
+		MaxOrderQty:  limits.MaxOrderQty,
+		QtyStep:      limits.QtyStep,
+		MinNotional:  limits.MinNotional,
+		PriceStep:    limits.PriceStep,
+		MaxLeverage:  limits.MaxLeverage,
+		UpdatedAt:    time.Now(),
+	}
+
+	ov.limits.Store(key, cached)
+}
+
+// GetLimits возвращает кэшированные лимиты
+func (ov *OrderValidator) GetLimits(exchangeName, symbol string) *CachedLimits {
+	key := LimitsKey{Exchange: exchangeName, Symbol: symbol}
+	if v, ok := ov.limits.Load(key); ok {
+		return v.(*CachedLimits)
+	}
+	return nil
+}
+
+// ValidateOrderQty проверяет и корректирует количество для ордера
+//
+// Выполняет:
+// 1. Проверку минимального количества (min_order_qty)
+// 2. Проверку максимального количества (max_order_qty)
+// 3. Округление до lot size (qty_step)
+// 4. Проверку минимальной суммы сделки (min_notional)
+//
+// Возвращает скорректированное количество и информацию о валидности
+func (ov *OrderValidator) ValidateOrderQty(
+	exchangeName string,
+	symbol string,
+	qty float64,
+	currentPrice float64,
+) *ValidationResult {
+	result := &ValidationResult{
+		Valid:       true,
+		AdjustedQty: qty,
+		Warnings:    make([]string, 0),
+	}
+
+	// Получаем лимиты (или дефолты)
+	limits := ov.GetLimits(exchangeName, symbol)
+	var minQty, maxQty, qtyStep, minNotional float64
+
+	if limits != nil {
+		minQty = limits.MinOrderQty
+		maxQty = limits.MaxOrderQty
+		qtyStep = limits.QtyStep
+		minNotional = limits.MinNotional
+	} else {
+		// Используем дефолты если лимиты не загружены
+		minQty = ov.defaultMinQty
+		maxQty = ov.defaultMaxQty
+		qtyStep = ov.defaultQtyStep
+		minNotional = ov.defaultMinNotional
+		result.Warnings = append(result.Warnings,
+			"using default limits for "+exchangeName+":"+symbol)
+	}
+
+	// 1. Округляем до lot size (qtyStep)
+	if qtyStep > 0 {
+		result.AdjustedQty = ov.roundToStep(qty, qtyStep)
+		if result.AdjustedQty != qty {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("qty adjusted from %.8f to %.8f (lot size: %.8f)",
+					qty, result.AdjustedQty, qtyStep))
+		}
+	}
+
+	// 2. Проверяем минимальное количество
+	if result.AdjustedQty < minQty {
+		result.Valid = false
+		result.Error = fmt.Sprintf("qty %.8f below minimum %.8f on %s",
+			result.AdjustedQty, minQty, exchangeName)
+		return result
+	}
+
+	// 3. Проверяем максимальное количество
+	if maxQty > 0 && result.AdjustedQty > maxQty {
+		// Ограничиваем до максимума
+		oldQty := result.AdjustedQty
+		result.AdjustedQty = ov.roundToStep(maxQty, qtyStep)
+		result.Warnings = append(result.Warnings,
+			fmt.Sprintf("qty limited from %.8f to max %.8f on %s",
+				oldQty, result.AdjustedQty, exchangeName))
+	}
+
+	// 4. Проверяем min notional (минимальная сумма в USDT)
+	if minNotional > 0 && currentPrice > 0 {
+		notional := result.AdjustedQty * currentPrice
+		if notional < minNotional {
+			// Рассчитываем минимальное количество для достижения min notional
+			requiredQty := minNotional / currentPrice
+			requiredQty = ov.roundToStep(requiredQty, qtyStep)
+
+			// Проверяем что требуемое qty не меньше minQty
+			if requiredQty < minQty {
+				requiredQty = minQty
+			}
+
+			result.Valid = false
+			result.Error = fmt.Sprintf(
+				"notional %.2f USDT below minimum %.2f USDT on %s (need qty >= %.8f)",
+				notional, minNotional, exchangeName, requiredQty)
+			return result
+		}
+	}
+
+	return result
+}
+
+// ValidateBothLegs проверяет обе ноги арбитража
+//
+// Находит максимальный объём, который удовлетворяет лимитам обеих бирж
+func (ov *OrderValidator) ValidateBothLegs(
+	longExchange string,
+	shortExchange string,
+	symbol string,
+	qty float64,
+	longPrice float64,
+	shortPrice float64,
+) *ValidationResult {
+	// Валидируем для лонга
+	longResult := ov.ValidateOrderQty(longExchange, symbol, qty, longPrice)
+	if !longResult.Valid {
+		return longResult
+	}
+
+	// Валидируем для шорта
+	shortResult := ov.ValidateOrderQty(shortExchange, symbol, qty, shortPrice)
+	if !shortResult.Valid {
+		return shortResult
+	}
+
+	// Берём минимальный из скорректированных объёмов
+	adjustedQty := longResult.AdjustedQty
+	if shortResult.AdjustedQty < adjustedQty {
+		adjustedQty = shortResult.AdjustedQty
+	}
+
+	// Собираем предупреждения
+	warnings := make([]string, 0)
+	warnings = append(warnings, longResult.Warnings...)
+	warnings = append(warnings, shortResult.Warnings...)
+
+	if adjustedQty != qty {
+		warnings = append(warnings,
+			fmt.Sprintf("final qty adjusted from %.8f to %.8f", qty, adjustedQty))
+	}
+
+	return &ValidationResult{
+		Valid:       true,
+		AdjustedQty: adjustedQty,
+		Warnings:    warnings,
+	}
+}
+
+// roundToStep округляет значение до ближайшего кратного step (в меньшую сторону)
+func (ov *OrderValidator) roundToStep(value, step float64) float64 {
+	if step <= 0 {
+		return value
+	}
+
+	// Округляем вниз до кратного step
+	return float64(int64(value/step)) * step
+}
+
+// RoundToLotSize публичная функция для округления до lot size
+func RoundToLotSize(value, lotSize float64) float64 {
+	if lotSize <= 0 {
+		return value
+	}
+	return float64(int64(value/lotSize)) * lotSize
+}
+
+// ============================================================
+// Расширение OrderExecutor для использования валидации
+// ============================================================
+
+// ExecuteWithValidation выполняет ордер с предварительной валидацией
+func (oe *OrderExecutor) ExecuteWithValidation(
+	ctx context.Context,
+	params ExecuteParams,
+	validator *OrderValidator,
+	longPrice float64,
+	shortPrice float64,
+) *ExecuteResult {
+	// Валидируем параметры
+	validation := validator.ValidateBothLegs(
+		params.LongExchange,
+		params.ShortExchange,
+		params.Symbol,
+		params.Volume,
+		longPrice,
+		shortPrice,
+	)
+
+	if !validation.Valid {
+		return &ExecuteResult{
+			Success: false,
+			Error:   fmt.Errorf("validation failed: %s", validation.Error),
+		}
+	}
+
+	// Используем скорректированный объём
+	params.Volume = validation.AdjustedQty
+
+	// Выполняем ордер
+	return oe.ExecuteParallel(ctx, params)
+}
+
+// ============================================================
+// Утилиты для работы с лимитами
+// ============================================================
+
+// LoadLimitsFromExchange загружает лимиты для символа с биржи
+func (ov *OrderValidator) LoadLimitsFromExchange(
+	ctx context.Context,
+	exch exchange.Exchange,
+	symbol string,
+) error {
+	limits, err := exch.GetLimits(ctx, symbol)
+	if err != nil {
+		return fmt.Errorf("failed to get limits from %s: %w", exch.GetName(), err)
+	}
+
+	ov.UpdateLimits(exch.GetName(), symbol, limits)
+	return nil
+}
+
+// PreloadLimits загружает лимиты для всех активных пар
+func (ov *OrderValidator) PreloadLimits(
+	ctx context.Context,
+	exchanges map[string]exchange.Exchange,
+	symbols []string,
+) map[string]error {
+	errors := make(map[string]error)
+
+	for exchName, exch := range exchanges {
+		for _, symbol := range symbols {
+			key := exchName + ":" + symbol
+			if err := ov.LoadLimitsFromExchange(ctx, exch, symbol); err != nil {
+				errors[key] = err
+			}
+		}
+	}
+
+	return errors
+}
+
+// LimitsInfo возвращает информацию о загруженных лимитах (для отладки)
+func (ov *OrderValidator) LimitsInfo() map[string]*CachedLimits {
+	result := make(map[string]*CachedLimits)
+
+	ov.limits.Range(func(key, value interface{}) bool {
+		k := key.(LimitsKey)
+		v := value.(*CachedLimits)
+		result[k.Exchange+":"+k.Symbol] = v
+		return true
+	})
+
+	return result
+}
+
+// ============================================================
+// Интеграция с pkg/retry для повторных попыток
+// ============================================================
+
+// ExecuteWithRetry выполняет ордер с retry при сетевых ошибках
+func (oe *OrderExecutor) ExecuteWithRetry(
+	ctx context.Context,
+	params ExecuteParams,
+	retryConfig retry.Config,
+) *ExecuteResult {
+	var result *ExecuteResult
+
+	operation := func() error {
+		result = oe.ExecuteParallel(ctx, params)
+		if result.Success {
+			return nil
+		}
+		// Проверяем, является ли ошибка retriable
+		if isRetriableError(result.Error) {
+			return result.Error
+		}
+		// Не-retriable ошибка - не повторяем
+		return retry.Permanent(result.Error)
+	}
+
+	err := retry.Do(ctx, operation, retryConfig)
+	if err != nil && result == nil {
+		result = &ExecuteResult{
+			Success: false,
+			Error:   err,
+		}
+	}
+
+	return result
+}
+
+// isRetriableError определяет, можно ли повторить операцию
+func isRetriableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Сетевые ошибки - можно повторить
+	retriablePatterns := []string{
+		"timeout",
+		"connection refused",
+		"connection reset",
+		"temporary failure",
+		"network unreachable",
+		"i/o timeout",
+		"EOF",
+		"rate limit", // rate limit - подождать и повторить
+	}
+
+	for _, pattern := range retriablePatterns {
+		if containsIgnoreCase(errStr, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// containsIgnoreCase проверяет наличие подстроки без учёта регистра
+func containsIgnoreCase(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
