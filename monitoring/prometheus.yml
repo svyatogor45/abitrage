@@ -1,0 +1,56 @@
+# Конфигурация Prometheus для мониторинга арбитражного бота
+#
+# Документация: https://prometheus.io/docs/prometheus/latest/configuration/configuration/
+#
+# Требования из Архитектуры.md:
+# - Мониторинг латентности Tick → Order (< 5ms целевое, > 50ms критическое)
+# - Счётчики обработанных событий
+# - Алерты на переполнение буферов и превышение порогов
+
+global:
+  scrape_interval: 15s     # Интервал сбора метрик
+  evaluation_interval: 15s # Интервал оценки правил алертов
+
+  # Метки, добавляемые ко всем метрикам
+  external_labels:
+    monitor: 'arbitrage-monitor'
+    environment: 'production'
+
+# Загрузка правил алертов
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# Конфигурация Alertmanager
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Конфигурация сбора метрик (scrape)
+scrape_configs:
+  # Сбор метрик самого Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Сбор метрик арбитражного бота (app)
+  - job_name: 'arbitrage-app'
+    # Более частый сбор для торгового ядра
+    scrape_interval: 5s
+    scrape_timeout: 4s
+
+    static_configs:
+      - targets: ['app:8080']
+        labels:
+          service: 'arbitrage'
+          component: 'backend'
+
+    # Путь к метрикам
+    metrics_path: /metrics
+    scheme: http
+
+  # Сбор метрик PostgreSQL (если используется postgres_exporter)
+  # - job_name: 'postgres'
+  #   static_configs:
+  #     - targets: ['postgres-exporter:9187']
