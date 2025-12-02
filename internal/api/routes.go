@@ -6,6 +6,7 @@ import (
 	"arbitrage/internal/api/handlers"
 	"arbitrage/internal/api/middleware"
 	"arbitrage/internal/service"
+	"arbitrage/internal/websocket"
 
 	"github.com/gorilla/mux"
 )
@@ -18,6 +19,7 @@ type Dependencies struct {
 	SettingsService     *service.SettingsService
 	NotificationService *service.NotificationService
 	BlacklistService    *service.BlacklistService
+	Hub                 *websocket.Hub
 }
 
 // SetupRoutes настраивает все HTTP маршруты приложения
@@ -164,9 +166,12 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 		api.HandleFunc("/settings", settingsHandler.UpdateSettings).Methods("PATCH")
 	}
 
-	// WebSocket route
-	// TODO: добавить WebSocket handler когда будет реализован
-	// router.HandleFunc("/ws/stream", wsHandler.ServeWS)
+	// WebSocket route для real-time обновлений
+	if deps != nil && deps.Hub != nil {
+		router.HandleFunc("/ws/stream", func(w http.ResponseWriter, r *http.Request) {
+			websocket.ServeWS(deps.Hub, w, r)
+		}).Methods("GET")
+	}
 
 	// Health check endpoint
 	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
