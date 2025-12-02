@@ -41,11 +41,11 @@ type HTX struct {
 	closeChan chan struct{}
 }
 
+// NewHTX создаёт новый экземпляр HTX (Huobi)
+// Использует глобальный HTTP клиент с connection pooling и оптимизированными таймаутами
 func NewHTX() *HTX {
 	return &HTX{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient:      GetGlobalHTTPClient().GetClient(),
 		tickerCallbacks: make(map[string]func(*Ticker)),
 		closeChan:       make(chan struct{}),
 	}
