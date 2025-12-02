@@ -7,13 +7,21 @@ import (
 	"arbitrage/internal/repository"
 )
 
+// WebSocketBroadcaster - интерфейс для отправки WebSocket сообщений
+//
+// Позволяет избежать циклических зависимостей между пакетами
+// и упрощает тестирование (можно подставить mock)
+type WebSocketBroadcaster interface {
+	BroadcastNotification(notif *models.Notification)
+}
+
 // NotificationService предоставляет бизнес-логику для управления уведомлениями.
 //
 // Отвечает за:
 // - Создание уведомлений с проверкой настроек
 // - Получение списка уведомлений с фильтрацией
 // - Очистку журнала уведомлений
-// - Broadcast уведомлений через WebSocket (опционально)
+// - Broadcast уведомлений через WebSocket
 //
 // Типы уведомлений:
 // - OPEN: открытие арбитража
@@ -27,8 +35,7 @@ import (
 type NotificationService struct {
 	notificationRepo *repository.NotificationRepository
 	settingsRepo     *repository.SettingsRepository
-	// wsHub опционален - используется для broadcast уведомлений
-	// wsHub *websocket.Hub
+	wsHub            WebSocketBroadcaster
 }
 
 // NewNotificationService создает новый экземпляр NotificationService.
@@ -40,6 +47,16 @@ func NewNotificationService(
 		notificationRepo: notificationRepo,
 		settingsRepo:     settingsRepo,
 	}
+}
+
+// SetWebSocketHub устанавливает WebSocket hub для broadcast уведомлений.
+//
+// Вызывается после инициализации Hub в main.go:
+//
+//	notifService := service.NewNotificationService(notifRepo, settingsRepo)
+//	notifService.SetWebSocketHub(wsHub)
+func (s *NotificationService) SetWebSocketHub(hub WebSocketBroadcaster) {
+	s.wsHub = hub
 }
 
 // CreateNotification создает новое уведомление.
@@ -70,13 +87,10 @@ func (s *NotificationService) CreateNotification(notif *models.Notification) err
 		return err
 	}
 
-	// TODO: Broadcast через WebSocket hub
-	// if s.wsHub != nil {
-	//     s.wsHub.Broadcast(&websocket.Message{
-	//         Type: "notification",
-	//         Data: notif,
-	//     })
-	// }
+	// Broadcast через WebSocket hub для real-time обновления UI
+	if s.wsHub != nil {
+		s.wsHub.BroadcastNotification(notif)
+	}
 
 	return nil
 }

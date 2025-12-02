@@ -133,10 +133,29 @@ type PositionUpdate struct {
 }
 
 // WebSocketHub - интерфейс для отправки данных клиентам
+//
+// Реализуется пакетом internal/websocket/Hub
+// Используется для real-time обновления UI:
+// - pairUpdate: состояние пар каждую секунду
+// - notification: события торговли
+// - balanceUpdate: балансы бирж каждую минуту
+// - statsUpdate: статистика при изменениях
 type WebSocketHub interface {
-	BroadcastPairUpdate(pairID int, data interface{})
+	// BroadcastPairUpdate отправляет обновление состояния пары
+	// Вызывается каждую секунду для пар в состоянии HOLDING
+	BroadcastPairUpdate(pairID int, runtime *models.PairRuntime)
+
+	// BroadcastNotification отправляет уведомление о событии
+	// Вызывается при OPEN, CLOSE, SL, LIQUIDATION, ERROR и др.
 	BroadcastNotification(notif *models.Notification)
+
+	// BroadcastBalanceUpdate отправляет обновление баланса биржи
+	// Вызывается каждую минуту для каждой подключенной биржи
 	BroadcastBalanceUpdate(exchange string, balance float64)
+
+	// BroadcastStatsUpdate отправляет обновление статистики
+	// Вызывается после завершения каждой сделки
+	BroadcastStatsUpdate(stats *models.Stats)
 }
 
 // NewEngine создает новый Engine с оптимизациями

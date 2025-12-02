@@ -7,6 +7,11 @@ import (
 	"arbitrage/internal/repository"
 )
 
+// StatsBroadcaster - интерфейс для отправки обновлений статистики через WebSocket
+type StatsBroadcaster interface {
+	BroadcastStatsUpdate(stats *models.Stats)
+}
+
 // StatsService предоставляет бизнес-логику для работы со статистикой.
 //
 // Функции:
@@ -14,9 +19,13 @@ import (
 // - GetTopPairs: получить топ-5 пар по указанной метрике
 // - ResetStats: сброс счетчиков статистики
 // - RecordTradeCompletion: записать завершенную сделку
+//
+// WebSocket интеграция:
+// - После каждой записи сделки отправляет statsUpdate через WebSocket
 type StatsService struct {
 	statsRepo *repository.StatsRepository
 	pairRepo  *repository.PairRepository
+	wsHub     StatsBroadcaster
 }
 
 // NewStatsService создает новый экземпляр StatsService
@@ -25,6 +34,16 @@ func NewStatsService(statsRepo *repository.StatsRepository, pairRepo *repository
 		statsRepo: statsRepo,
 		pairRepo:  pairRepo,
 	}
+}
+
+// SetWebSocketHub устанавливает WebSocket hub для broadcast статистики.
+//
+// Вызывается после инициализации Hub в main.go:
+//
+//	statsService := service.NewStatsService(statsRepo, pairRepo)
+//	statsService.SetWebSocketHub(wsHub)
+func (s *StatsService) SetWebSocketHub(hub StatsBroadcaster) {
+	s.wsHub = hub
 }
 
 // GetStats возвращает полную агрегированную статистику.
@@ -72,8 +91,21 @@ func (s *StatsService) GetTopPairs(metric string, limit int) ([]models.PairStat,
 // ВАЖНО: Это действие необратимо!
 // Удаляет все записи из таблицы trades.
 // Используется по явному запросу пользователя.
+// После сброса отправляет statsUpdate через WebSocket.
 func (s *StatsService) ResetStats() error {
-	return s.statsRepo.ResetCounters()
+	if err := s.statsRepo.ResetCounters(); err != nil {
+		return err
+	}
+
+	// Broadcast обнуленной статистики через WebSocket
+	if s.wsHub != nil {
+		stats, err := s.statsRepo.GetStats()
+		if err == nil && stats != nil {
+			s.wsHub.BroadcastStatsUpdate(stats)
+		}
+	}
+
+	return nil
 }
 
 // RecordTradeCompletion записывает завершенную сделку.
@@ -82,6 +114,7 @@ func (s *StatsService) ResetStats() error {
 // Обновляет:
 // - Глобальную статистику (таблица trades)
 // - Локальную статистику пары (trades_count, total_pnl)
+// - Отправляет statsUpdate через WebSocket
 //
 // Параметры:
 // - pairID: ID торговой пары
@@ -111,12 +144,20 @@ func (s *StatsService) RecordTradeCompletion(
 		// Увеличиваем счетчик сделок
 		if err := s.pairRepo.IncrementTrades(pairID); err != nil {
 			// Логируем ошибку, но не прерываем - основная запись уже сделана
-			return nil
 		}
 
 		// Обновляем PNL пары
 		if err := s.pairRepo.UpdatePnl(pairID, pnl); err != nil {
-			return nil
+			// Логируем ошибку, но не прерываем
+		}
+	}
+
+	// Broadcast обновленной статистики через WebSocket
+	if s.wsHub != nil {
+		// Получаем актуальную статистику и отправляем
+		stats, err := s.statsRepo.GetStats()
+		if err == nil && stats != nil {
+			s.wsHub.BroadcastStatsUpdate(stats)
 		}
 	}
 
