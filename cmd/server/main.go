@@ -15,6 +15,7 @@ import (
 	"arbitrage/internal/config"
 	"arbitrage/internal/repository"
 	"arbitrage/internal/service"
+	"arbitrage/internal/websocket"
 
 	_ "github.com/lib/pq"
 )
@@ -75,9 +76,15 @@ func main() {
 	// Инициализация BlacklistService
 	blacklistService := service.NewBlacklistService(blacklistRepo)
 
-	// TODO: Инициализация WebSocket hub
-	// hub := websocket.NewHub()
-	// go hub.Run()
+	// Инициализация WebSocket hub
+	wsHub := websocket.NewHub()
+	go wsHub.Run()
+	log.Println("WebSocket hub started")
+
+	// Подключение WebSocket hub к сервисам для real-time обновлений
+	notificationService.SetWebSocketHub(wsHub)
+	exchangeService.SetWebSocketHub(wsHub)
+	statsService.SetWebSocketHub(wsHub)
 
 	// TODO: Инициализация бота
 	// botEngine := bot.NewEngine(db, hub)
@@ -91,6 +98,7 @@ func main() {
 		SettingsService:     settingsService,
 		NotificationService: notificationService,
 		BlacklistService:    blacklistService,
+		Hub:                 wsHub,
 	}
 
 	// Настройка HTTP роутера
