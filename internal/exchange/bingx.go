@@ -41,11 +41,11 @@ type BingX struct {
 	closeChan chan struct{}
 }
 
+// NewBingX создаёт новый экземпляр BingX
+// Использует глобальный HTTP клиент с connection pooling и оптимизированными таймаутами
 func NewBingX() *BingX {
 	return &BingX{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient:      GetGlobalHTTPClient().GetClient(),
 		tickerCallbacks: make(map[string]func(*Ticker)),
 		closeChan:       make(chan struct{}),
 	}

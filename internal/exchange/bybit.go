@@ -49,11 +49,10 @@ type Bybit struct {
 }
 
 // NewBybit создает новый экземпляр Bybit
+// Использует глобальный HTTP клиент с connection pooling и оптимизированными таймаутами
 func NewBybit() *Bybit {
 	return &Bybit{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient:      GetGlobalHTTPClient().GetClient(),
 		tickerCallbacks: make(map[string]func(*Ticker)),
 		closeChan:       make(chan struct{}),
 	}

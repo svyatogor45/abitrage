@@ -40,11 +40,11 @@ type Gate struct {
 	closeChan chan struct{}
 }
 
+// NewGate создаёт новый экземпляр Gate.io
+// Использует глобальный HTTP клиент с connection pooling и оптимизированными таймаутами
 func NewGate() *Gate {
 	return &Gate{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient:      GetGlobalHTTPClient().GetClient(),
 		tickerCallbacks: make(map[string]func(*Ticker)),
 		closeChan:       make(chan struct{}),
 	}

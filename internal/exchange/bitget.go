@@ -45,11 +45,11 @@ type Bitget struct {
 	closeChan chan struct{}
 }
 
+// NewBitget создаёт новый экземпляр Bitget
+// Использует глобальный HTTP клиент с connection pooling и оптимизированными таймаутами
 func NewBitget() *Bitget {
 	return &Bitget{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient:      GetGlobalHTTPClient().GetClient(),
 		tickerCallbacks: make(map[string]func(*Ticker)),
 		closeChan:       make(chan struct{}),
 	}

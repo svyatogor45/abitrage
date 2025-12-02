@@ -43,11 +43,11 @@ type OKX struct {
 	closeChan chan struct{}
 }
 
+// NewOKX создаёт новый экземпляр OKX
+// Использует глобальный HTTP клиент с connection pooling и оптимизированными таймаутами
 func NewOKX() *OKX {
 	return &OKX{
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
+		httpClient:      GetGlobalHTTPClient().GetClient(),
 		tickerCallbacks: make(map[string]func(*Ticker)),
 		closeChan:       make(chan struct{}),
 	}
