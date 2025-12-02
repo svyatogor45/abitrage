@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -81,6 +82,22 @@ type Engine struct {
 	// Исполнитель ордеров
 	orderExec *OrderExecutor
 
+	// Валидатор ордеров (лимиты бирж)
+	orderValidator *OrderValidator
+
+	// Анализатор стаканов (ликвидность)
+	orderBookAnalyzer *OrderBookAnalyzer
+
+	// Арбитражный детектор и координатор
+	arbDetector    *ArbitrageDetector
+	arbCoordinator *ArbitrageCoordinator
+
+	// Менеджер частичного входа
+	partialManager *PartialEntryManager
+
+	// Обработчик провала второй ноги
+	secondLegFailHandler *SecondLegFailHandler
+
 	// Worker pool: шардированные каналы по символам
 	priceShards     []*priceShard
 	numShards       int
@@ -89,6 +106,9 @@ type Engine struct {
 	// Канал для позиций (отдельный, не шардируется)
 	positionUpdates chan PositionUpdate
 	shutdown        chan struct{}
+
+	// Канал для уведомлений
+	notificationChan chan *models.Notification
 
 	// WebSocket hub для отправки данных клиентам
 	wsHub WebSocketHub
@@ -174,17 +194,18 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	workersPerShard := 2 // 2 workers на шард (можно увеличить до 4)
 
 	e := &Engine{
-		cfg:             cfg,
-		exchanges:       make(map[string]exchange.Exchange),
-		pairs:           make(map[int]*PairState),
+		cfg:              cfg,
+		exchanges:        make(map[string]exchange.Exchange),
+		pairs:            make(map[int]*PairState),
 		// pairsBySymbol: sync.Map инициализируется автоматически (zero value)
-		priceTracker:    NewPriceTracker(numShards),
-		priceShards:     make([]*priceShard, numShards),
-		numShards:       numShards,
-		workersPerShard: workersPerShard,
-		positionUpdates: make(chan PositionUpdate, 1000),
-		shutdown:        make(chan struct{}),
-		wsHub:           wsHub,
+		priceTracker:     NewPriceTracker(numShards),
+		priceShards:      make([]*priceShard, numShards),
+		numShards:        numShards,
+		workersPerShard:  workersPerShard,
+		positionUpdates:  make(chan PositionUpdate, 1000),
+		notificationChan: make(chan *models.Notification, 100),
+		shutdown:         make(chan struct{}),
+		wsHub:            wsHub,
 	}
 
 	// Инициализация шардов для worker pool
@@ -194,8 +215,53 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 		}
 	}
 
+	// Инициализация основных компонентов
 	e.spreadCalc = NewSpreadCalculator(e.priceTracker)
 	e.orderExec = NewOrderExecutor(e.exchanges, cfg.Bot)
+
+	// Инициализация валидатора ордеров
+	e.orderValidator = NewOrderValidator(func(symbol, exchange string) float64 {
+		price := e.priceTracker.GetExchangePrice(symbol, exchange)
+		if price != nil {
+			return price.BidPrice
+		}
+		return 0
+	})
+
+	// Инициализация анализатора стаканов (5 уровней, 5 секунд актуальности)
+	e.orderBookAnalyzer = NewOrderBookAnalyzer(5, 5*time.Second)
+
+	// Инициализация арбитражного детектора
+	e.arbDetector = NewArbitrageDetector(
+		e.priceTracker,
+		e.spreadCalc,
+		e.orderBookAnalyzer,
+	)
+
+	// Инициализация координатора арбитража
+	e.arbCoordinator = NewArbitrageCoordinator(
+		e.arbDetector,
+		e.orderExec,
+		e.orderValidator,
+		cfg.Bot.MaxConcurrentArbs,
+		&e.activeArbs,
+	)
+
+	// Инициализация менеджера частичного входа
+	e.partialManager = NewPartialEntryManager(
+		e.arbDetector,
+		e.orderExec,
+		e.orderValidator,
+	)
+	e.arbCoordinator.SetPartialManager(e.partialManager)
+
+	// Инициализация обработчика провала второй ноги
+	e.secondLegFailHandler = NewSecondLegFailHandler(
+		e.orderExec,
+		e.notificationChan,
+		true, // pauseOnFail
+	)
+	e.arbCoordinator.SetFailHandler(e.secondLegFailHandler)
 
 	return e
 }
@@ -213,11 +279,166 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	// Остальные воркеры
 	go e.positionEventLoop(ctx)
-	go e.periodicTasks(ctx) // балансы, статистика для UI
+	go e.periodicTasks(ctx)           // балансы, статистика для UI
+	go e.notificationWorker(ctx)      // обработка уведомлений
+	go e.exitConditionChecker(ctx)    // проверка условий выхода
 
 	<-ctx.Done()
 	close(e.shutdown)
 	return ctx.Err()
+}
+
+// notificationWorker обрабатывает уведомления и отправляет их в WebSocket
+func (e *Engine) notificationWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case notif := <-e.notificationChan:
+			if e.wsHub != nil {
+				e.wsHub.BroadcastNotification(notif)
+			}
+		}
+	}
+}
+
+// exitConditionChecker периодически проверяет условия выхода для открытых позиций
+func (e *Engine) exitConditionChecker(ctx context.Context) {
+	// Проверяем условия выхода каждые 500ms
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.checkAllExitConditions(ctx)
+		}
+	}
+}
+
+// checkAllExitConditions проверяет условия выхода для всех позиций в HOLDING
+func (e *Engine) checkAllExitConditions(ctx context.Context) {
+	// Собираем пары в состоянии HOLDING
+	e.pairsMu.RLock()
+	holdingPairs := make([]*PairState, 0)
+	for _, ps := range e.pairs {
+		if ps.Runtime.State == models.StateHolding {
+			holdingPairs = append(holdingPairs, ps)
+		}
+	}
+	e.pairsMu.RUnlock()
+
+	// Проверяем условия выхода для каждой
+	for _, ps := range holdingPairs {
+		e.checkExitConditionsForPair(ctx, ps)
+	}
+}
+
+// checkExitConditionsForPair проверяет условия выхода для конкретной пары
+func (e *Engine) checkExitConditionsForPair(ctx context.Context, ps *PairState) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Проверяем что пара всё ещё в HOLDING
+	if ps.Runtime.State != models.StateHolding {
+		return
+	}
+
+	// Используем ArbitrageDetector для проверки условий
+	exitConditions := e.arbDetector.CheckExitConditions(ps)
+
+	// Обновляем runtime данные
+	ps.Runtime.CurrentSpread = exitConditions.CurrentSpread
+	ps.Runtime.UnrealizedPnl = exitConditions.CurrentPnl
+	ps.Runtime.LastUpdate = time.Now()
+
+	if !exitConditions.ShouldExit {
+		return
+	}
+
+	// Условия выхода достигнуты - выполняем закрытие
+	ps.Runtime.State = models.StateExiting
+
+	// Асинхронное закрытие
+	go e.executeExit(ps, exitConditions.Reason)
+}
+
+// executeExit выполняет закрытие позиции
+func (e *Engine) executeExit(ps *PairState, reason ExitReason) {
+	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
+	defer cancel()
+
+	// Закрываем через OrderExecutor
+	result := e.orderExec.CloseParallel(ctx, CloseParams{
+		Symbol: ps.Config.Symbol,
+		Legs:   ps.Runtime.Legs,
+	})
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if result.Success {
+		// Успешное закрытие
+		ps.Runtime.RealizedPnl += result.TotalPnl
+		ps.Runtime.Legs = nil
+		ps.Runtime.FilledParts = 0
+		e.decrementActiveArbs()
+
+		// Определяем следующее состояние
+		if reason == ExitReasonStopLoss || reason == ExitReasonLiquidation {
+			ps.Runtime.State = models.StatePaused
+			ps.Config.Status = "paused"
+			atomic.StoreInt32(&ps.isReady, 0)
+		} else {
+			ps.Runtime.State = models.StateReady
+			atomic.StoreInt32(&ps.isReady, 1)
+		}
+
+		// Отправляем уведомление
+		e.notifyTradeClosed(ps, result, reason)
+	} else {
+		// Ошибка закрытия
+		ps.Runtime.State = models.StateError
+		e.notifyError(ps, result.Error)
+	}
+}
+
+// notifyTradeClosed отправляет уведомление о закрытии позиции
+func (e *Engine) notifyTradeClosed(ps *PairState, result *ExecuteResult, reason ExitReason) {
+	notifType := "CLOSE"
+	severity := "info"
+
+	switch reason {
+	case ExitReasonStopLoss:
+		notifType = "SL"
+		severity = "warn"
+	case ExitReasonLiquidation:
+		notifType = "LIQUIDATION"
+		severity = "error"
+	}
+
+	pairID := ps.Config.ID
+	notif := &models.Notification{
+		Timestamp: time.Now(),
+		Type:      notifType,
+		Severity:  severity,
+		PairID:    &pairID,
+		Message: fmt.Sprintf("%s closed: PNL %.2f USDT (reason: %s)",
+			ps.Config.Symbol, result.TotalPnl, reason),
+		Meta: map[string]interface{}{
+			"symbol":       ps.Config.Symbol,
+			"pnl":          result.TotalPnl,
+			"reason":       string(reason),
+			"realized_pnl": ps.Runtime.RealizedPnl,
+		},
+	}
+
+	select {
+	case e.notificationChan <- notif:
+	default:
+	}
 }
 
 // priceEventWorker - воркер для обработки ценовых событий одного шарда
@@ -276,6 +497,12 @@ func (e *Engine) handlePriceUpdate(update *PriceUpdate) {
 
 // checkArbitrageOpportunity - проверка арбитражной возможности для пары
 // ОПТИМИЗАЦИЯ: atomic быстрая проверка + atomic counter для activeArbs
+//
+// Использует ArbitrageDetector для полной проверки условий:
+// - Спред >= entry_spread (с учётом комиссий)
+// - Достаточная ликвидность на обеих биржах
+// - Маржа достаточна
+// - Лимиты ордеров соблюдены
 func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 	// ОПТИМИЗАЦИЯ: быстрая проверка без Lock
 	// Если пара не ready, пропускаем без захвата mutex
@@ -297,14 +524,17 @@ func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 		return
 	}
 
-	// Получаем лучшую связку O(1) - уже вычислено в PriceTracker
-	opportunity := e.spreadCalc.GetBestOpportunity(ps.Config.Symbol)
-	if opportunity == nil {
-		return
-	}
+	// Используем ArbitrageDetector для полной проверки условий входа
+	currentArbs := atomic.LoadInt64(&e.activeArbs)
+	conditions := e.arbDetector.CheckEntryConditions(
+		ps,
+		currentArbs,
+		e.cfg.Bot.MaxConcurrentArbs,
+		e.orderValidator,
+	)
 
-	// Проверяем условия входа
-	if !e.shouldEnter(ps, opportunity) {
+	// Условия не выполнены - выходим
+	if !conditions.CanEnter {
 		return
 	}
 
@@ -314,26 +544,83 @@ func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 	e.incrementActiveArbs()
 
 	// Асинхронный вход (не блокируем обработку других событий)
-	go e.executeEntry(ps, opportunity)
+	go e.executeEntryWithConditions(ps, conditions)
 }
 
-// shouldEnter - проверка всех условий для входа
+// shouldEnter - проверка всех условий для входа (legacy, используется ArbitrageDetector)
 func (e *Engine) shouldEnter(ps *PairState, opp *ArbitrageOpportunity) bool {
-	// 1. Спред достаточный?
-	if opp.NetSpread < ps.Config.EntrySpreadPct {
-		return false
+	// Используем ArbitrageDetector для полной проверки
+	conditions := e.arbDetector.CheckEntryConditions(
+		ps,
+		atomic.LoadInt64(&e.activeArbs),
+		e.cfg.Bot.MaxConcurrentArbs,
+		e.orderValidator,
+	)
+	return conditions.CanEnter
+}
+
+// executeEntryWithConditions - исполнение входа с предварительно проверенными условиями
+func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryConditions) {
+	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
+	defer cancel()
+
+	opp := conditions.Opportunity
+	volume := conditions.AdjustedVolume
+
+	var result *ExecuteResult
+
+	// Проверяем нужен ли частичный вход
+	if ps.Config.NOrders > 1 && e.partialManager != nil {
+		// Частичный вход через PartialEntryManager
+		partialResult := e.partialManager.ExecutePartialEntry(ctx, PartialEntryParams{
+			Symbol:        ps.Config.Symbol,
+			TotalVolume:   volume,
+			NOrders:       ps.Config.NOrders,
+			LongExchange:  opp.LongExchange,
+			ShortExchange: opp.ShortExchange,
+			MinSpread:     ps.Config.EntrySpreadPct * 0.8, // 80% от entry spread
+		})
+
+		result = &ExecuteResult{
+			Success: partialResult.Success,
+			Legs:    partialResult.Legs,
+			Error:   partialResult.Error,
+		}
+	} else {
+		// Одиночный вход через OrderExecutor
+		result = e.orderExec.ExecuteParallel(ctx, ExecuteParams{
+			Symbol:        ps.Config.Symbol,
+			Volume:        volume,
+			LongExchange:  opp.LongExchange,
+			ShortExchange: opp.ShortExchange,
+			NOrders:       1,
+		})
 	}
 
-	// 2. Маржа достаточна на обеих биржах?
-	// TODO: проверка маржи (кэшируется, не делаем сетевой запрос)
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 
-	// 3. Лимиты ордеров соблюдены?
-	// TODO: проверка min/max qty (кэшируется)
+	if result.Success {
+		// Успешный вход
+		ps.Runtime.State = models.StateHolding
+		ps.Runtime.Legs = result.Legs
+		ps.Runtime.FilledParts = 1
+		ps.Runtime.LastUpdate = time.Now()
 
-	return true
+		e.notifyTradeOpened(ps, result)
+	} else {
+		// Ошибка - возврат в готовность
+		ps.Runtime.State = models.StateReady
+		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
+		atomic.StoreInt32(&ps.isReady, 1)
+		e.decrementActiveArbs()
+
+		e.notifyError(ps, result.Error)
+	}
 }
 
 // executeEntry - исполнение входа в арбитраж (ПАРАЛЛЕЛЬНЫЕ ОРДЕРА!)
+// Legacy метод, используйте executeEntryWithConditions
 func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
 	defer cancel()
@@ -355,6 +642,7 @@ func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
 		ps.Runtime.State = models.StateHolding
 		ps.Runtime.Legs = result.Legs
 		ps.Runtime.FilledParts = 1
+		ps.Runtime.LastUpdate = time.Now()
 
 		e.notifyTradeOpened(ps, result)
 	} else {
@@ -507,15 +795,117 @@ func (e *Engine) decrementActiveArbs() {
 }
 
 func (e *Engine) updatePairPnl(ps *PairState) {
-	// TODO: расчёт PNL из текущих цен в PriceTracker
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if ps.Runtime.State != models.StateHolding || len(ps.Runtime.Legs) != 2 {
+		return
+	}
+
+	var longLeg, shortLeg *models.Leg
+	for i := range ps.Runtime.Legs {
+		if ps.Runtime.Legs[i].Side == "long" {
+			longLeg = &ps.Runtime.Legs[i]
+		} else {
+			shortLeg = &ps.Runtime.Legs[i]
+		}
+	}
+
+	if longLeg == nil || shortLeg == nil {
+		return
+	}
+
+	// Рассчитываем PNL через SpreadCalculator
+	pnl := e.spreadCalc.CalculatePnl(
+		ps.Config.Symbol,
+		longLeg.Exchange, longLeg.EntryPrice,
+		shortLeg.Exchange, shortLeg.EntryPrice,
+		longLeg.Quantity,
+	)
+	ps.Runtime.UnrealizedPnl = pnl
+
+	// Рассчитываем текущий спред
+	currentSpread := e.spreadCalc.GetCurrentSpread(
+		ps.Config.Symbol,
+		longLeg.Exchange,
+		shortLeg.Exchange,
+	)
+	ps.Runtime.CurrentSpread = currentSpread
+
+	// Обновляем текущие цены в ногах
+	if longPrice := e.priceTracker.GetExchangePrice(ps.Config.Symbol, longLeg.Exchange); longPrice != nil {
+		longLeg.CurrentPrice = longPrice.BidPrice
+		longLeg.UnrealizedPnl = (longPrice.BidPrice - longLeg.EntryPrice) * longLeg.Quantity
+	}
+	if shortPrice := e.priceTracker.GetExchangePrice(ps.Config.Symbol, shortLeg.Exchange); shortPrice != nil {
+		shortLeg.CurrentPrice = shortPrice.AskPrice
+		shortLeg.UnrealizedPnl = (shortLeg.EntryPrice - shortPrice.AskPrice) * shortLeg.Quantity
+	}
+
+	ps.Runtime.LastUpdate = time.Now()
 }
 
 func (e *Engine) notifyTradeOpened(ps *PairState, result *ExecuteResult) {
-	// TODO: создать уведомление
+	if len(result.Legs) < 2 {
+		return
+	}
+
+	longLeg := result.Legs[0]
+	shortLeg := result.Legs[1]
+	if longLeg.Side != "long" {
+		longLeg, shortLeg = shortLeg, longLeg
+	}
+
+	pairID := ps.Config.ID
+	notif := &models.Notification{
+		Timestamp: time.Now(),
+		Type:      "OPEN",
+		Severity:  "info",
+		PairID:    &pairID,
+		Message: fmt.Sprintf("%s opened: Long on %s @ %.4f, Short on %s @ %.4f",
+			ps.Config.Symbol,
+			longLeg.Exchange, longLeg.EntryPrice,
+			shortLeg.Exchange, shortLeg.EntryPrice),
+		Meta: map[string]interface{}{
+			"symbol":          ps.Config.Symbol,
+			"long_exchange":   longLeg.Exchange,
+			"long_price":      longLeg.EntryPrice,
+			"long_qty":        longLeg.Quantity,
+			"short_exchange":  shortLeg.Exchange,
+			"short_price":     shortLeg.EntryPrice,
+			"short_qty":       shortLeg.Quantity,
+		},
+	}
+
+	select {
+	case e.notificationChan <- notif:
+	default:
+		// Канал заполнен, пропускаем
+	}
 }
 
 func (e *Engine) notifyError(ps *PairState, err error) {
-	// TODO: создать уведомление об ошибке
+	if err == nil {
+		return
+	}
+
+	pairID := ps.Config.ID
+	notif := &models.Notification{
+		Timestamp: time.Now(),
+		Type:      "ERROR",
+		Severity:  "error",
+		PairID:    &pairID,
+		Message:   fmt.Sprintf("%s error: %v", ps.Config.Symbol, err),
+		Meta: map[string]interface{}{
+			"symbol": ps.Config.Symbol,
+			"error":  err.Error(),
+		},
+	}
+
+	select {
+	case e.notificationChan <- notif:
+	default:
+	}
 }
 
 // ============ API для добавления бирж и пар ============
