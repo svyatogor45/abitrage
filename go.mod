@@ -8,6 +8,7 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/lib/pq v1.10.9
 	github.com/prometheus/client_golang v1.18.0
+	golang.org/x/crypto v0.15.0
 )
 
 require (
