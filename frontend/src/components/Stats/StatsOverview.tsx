@@ -1,19 +1,28 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import clsx from 'clsx';
 import { statsApi } from '@/services/api';
-import type { Stats } from '@/types';
+import { useStatsUpdates } from '@/hooks/useWebSocket';
+import type { Stats, StatsUpdateMessage } from '@/types';
 
 /**
  * Обзор статистики
  */
 export const StatsOverview: React.FC = () => {
   const queryClient = useQueryClient();
+  const [wsStats, setWsStats] = useState<Partial<StatsUpdateMessage> | null>(null);
 
   const { data: stats, isLoading } = useQuery({
     queryKey: ['stats'],
     queryFn: statsApi.get,
-    refetchInterval: 60000, // Обновление каждую минуту
+    refetchInterval: 60000, // Fallback обновление каждую минуту, если WebSocket недоступен
+  });
+
+  // Подписка на WebSocket обновления статистики
+  useStatsUpdates((update: StatsUpdateMessage) => {
+    setWsStats(update);
+    // Инвалидируем кэш для получения полных данных при следующем запросе
+    queryClient.invalidateQueries({ queryKey: ['stats'] });
   });
 
   const resetMutation = useMutation({
@@ -54,10 +63,32 @@ export const StatsOverview: React.FC = () => {
     );
   }
 
+  // Объединяем данные из API с обновлениями из WebSocket
+  const mergedStats: Stats = {
+    ...stats,
+    // Обновляем только те поля, которые приходят через WebSocket
+    ...(wsStats && {
+      totalTrades: wsStats.totalTrades ?? stats.totalTrades,
+      totalPnl: wsStats.totalPnl ?? stats.totalPnl,
+      todayTrades: wsStats.todayTrades ?? stats.todayTrades,
+      todayPnl: wsStats.todayPnl ?? stats.todayPnl,
+    }),
+  };
+
   return (
     <div className="bg-surface border border-border rounded-lg p-6">
       <div className="flex items-center justify-between mb-6">
-        <h2 className="text-xl font-bold text-white">Статистика</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-xl font-bold text-white">Статистика</h2>
+          {wsStats && (
+            <span className="text-xs text-green-500 flex items-center gap-1" title="Обновления в реальном времени">
+              <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 20 20">
+                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+              </svg>
+              Live
+            </span>
+          )}
+        </div>
         <button
           onClick={() => {
             if (confirm('Сбросить всю статистику?')) {
@@ -80,9 +111,9 @@ export const StatsOverview: React.FC = () => {
         <StatCard
           title="Сделки"
           items={[
-            { label: 'Сегодня', value: stats.todayTrades },
-            { label: 'Неделя', value: stats.weekTrades },
-            { label: 'Месяц', value: stats.monthTrades },
+            { label: 'Сегодня', value: mergedStats.todayTrades },
+            { label: 'Неделя', value: mergedStats.weekTrades },
+            { label: 'Месяц', value: mergedStats.monthTrades },
           ]}
         />
 
@@ -90,9 +121,9 @@ export const StatsOverview: React.FC = () => {
         <StatCard
           title="PNL (USDT)"
           items={[
-            { label: 'Сегодня', value: formatPnl(stats.todayPnl), color: stats.todayPnl >= 0 ? 'green' : 'red' },
-            { label: 'Неделя', value: formatPnl(stats.weekPnl), color: stats.weekPnl >= 0 ? 'green' : 'red' },
-            { label: 'Месяц', value: formatPnl(stats.monthPnl), color: stats.monthPnl >= 0 ? 'green' : 'red' },
+            { label: 'Сегодня', value: formatPnl(mergedStats.todayPnl), color: mergedStats.todayPnl >= 0 ? 'green' : 'red' },
+            { label: 'Неделя', value: formatPnl(mergedStats.weekPnl), color: mergedStats.weekPnl >= 0 ? 'green' : 'red' },
+            { label: 'Месяц', value: formatPnl(mergedStats.monthPnl), color: mergedStats.monthPnl >= 0 ? 'green' : 'red' },
           ]}
         />
 
@@ -100,22 +131,22 @@ export const StatsOverview: React.FC = () => {
         <StatCard
           title="Stop Loss"
           items={[
-            { label: 'Сегодня', value: stats.stopLossStats.today },
-            { label: 'Неделя', value: stats.stopLossStats.week },
-            { label: 'Месяц', value: stats.stopLossStats.month },
+            { label: 'Сегодня', value: mergedStats.stopLossStats.today },
+            { label: 'Неделя', value: mergedStats.stopLossStats.week },
+            { label: 'Месяц', value: mergedStats.stopLossStats.month },
           ]}
-          warning={stats.stopLossStats.month > 0}
+          warning={mergedStats.stopLossStats.month > 0}
         />
 
         {/* Ликвидации */}
         <StatCard
           title="Ликвидации"
           items={[
-            { label: 'Сегодня', value: stats.liquidationStats.today },
-            { label: 'Неделя', value: stats.liquidationStats.week },
-            { label: 'Месяц', value: stats.liquidationStats.month },
+            { label: 'Сегодня', value: mergedStats.liquidationStats.today },
+            { label: 'Неделя', value: mergedStats.liquidationStats.week },
+            { label: 'Месяц', value: mergedStats.liquidationStats.month },
           ]}
-          danger={stats.liquidationStats.month > 0}
+          danger={mergedStats.liquidationStats.month > 0}
         />
       </div>
 
@@ -123,17 +154,17 @@ export const StatsOverview: React.FC = () => {
       <div className="grid grid-cols-2 gap-4 p-4 bg-gray-800/50 rounded-lg">
         <div>
           <div className="text-sm text-gray-400">Всего сделок</div>
-          <div className="text-2xl font-bold text-white">{stats.totalTrades}</div>
+          <div className="text-2xl font-bold text-white">{mergedStats.totalTrades}</div>
         </div>
         <div>
           <div className="text-sm text-gray-400">Общий PNL</div>
           <div
             className={clsx(
               'text-2xl font-bold',
-              stats.totalPnl >= 0 ? 'text-green-500' : 'text-red-500'
+              mergedStats.totalPnl >= 0 ? 'text-green-500' : 'text-red-500'
             )}
           >
-            {formatPnl(stats.totalPnl)} USDT
+            {formatPnl(mergedStats.totalPnl)} USDT
           </div>
         </div>
       </div>
