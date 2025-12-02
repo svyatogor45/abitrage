@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -30,8 +29,8 @@ type HTX struct {
 
 	httpClient *http.Client
 
-	wsConn   *websocket.Conn
-	wsMu     sync.RWMutex
+	// WebSocket manager с автоматическим переподключением
+	wsManager *WSReconnectManager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -466,16 +465,23 @@ func (h *HTX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	h.tickerCallbacks[symbol] = callback
 	h.callbackMu.Unlock()
 
-	h.wsMu.Lock()
-	defer h.wsMu.Unlock()
+	if h.wsManager == nil {
+		config := DefaultWSReconnectConfig()
+		h.wsManager = NewWSReconnectManager("htx", htxWSURL, config)
 
-	if h.wsConn == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(htxWSURL, nil)
-		if err != nil {
+		h.wsManager.SetOnMessage(h.handleMessage)
+		h.wsManager.SetOnConnect(func() {
+			log.Printf("[htx] WebSocket connected")
+		})
+		h.wsManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[htx] WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := h.wsManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		h.wsConn = conn
-		go h.handleMessages()
 	}
 
 	contract := h.toHTXSymbol(symbol)
@@ -484,77 +490,57 @@ func (h *HTX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		"id":  fmt.Sprintf("ticker_%s", contract),
 	}
 
-	return h.wsConn.WriteJSON(subMsg)
+	h.wsManager.AddSubscription(subMsg)
+	return h.wsManager.Send(subMsg)
 }
 
-func (h *HTX) handleMessages() {
-	for {
-		select {
-		case <-h.closeChan:
-			return
-		default:
-		}
+// handleMessage обрабатывает одно сообщение из WebSocket
+func (h *HTX) handleMessage(message []byte) {
+	// HTX отправляет сжатые сообщения, нужно распаковать
+	// Для упрощения пропускаем распаковку и обрабатываем как JSON
 
-		h.wsMu.RLock()
-		conn := h.wsConn
-		h.wsMu.RUnlock()
+	var msg struct {
+		Ch   string `json:"ch"`
+		Tick struct {
+			Bid   []float64 `json:"bid"`
+			Ask   []float64 `json:"ask"`
+			Close float64   `json:"close"`
+		} `json:"tick"`
+		Ts int64 `json:"ts"`
+	}
 
-		if conn == nil {
-			return
-		}
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+	if strings.Contains(msg.Ch, ".detail") {
+		// Извлекаем symbol из канала
+		parts := strings.Split(msg.Ch, ".")
+		if len(parts) >= 2 {
+			contract := parts[1]
+			symbol := h.fromHTXSymbol(contract)
 
-		// HTX отправляет сжатые сообщения, нужно распаковать
-		// Для упрощения пропускаем распаковку и обрабатываем как JSON
+			h.callbackMu.RLock()
+			callback, ok := h.tickerCallbacks[symbol]
+			h.callbackMu.RUnlock()
 
-		var msg struct {
-			Ch   string `json:"ch"`
-			Tick struct {
-				Bid   []float64 `json:"bid"`
-				Ask   []float64 `json:"ask"`
-				Close float64   `json:"close"`
-			} `json:"tick"`
-			Ts int64 `json:"ts"`
-		}
-
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if strings.Contains(msg.Ch, ".detail") {
-			// Извлекаем symbol из канала
-			parts := strings.Split(msg.Ch, ".")
-			if len(parts) >= 2 {
-				contract := parts[1]
-				symbol := h.fromHTXSymbol(contract)
-
-				h.callbackMu.RLock()
-				callback, ok := h.tickerCallbacks[symbol]
-				h.callbackMu.RUnlock()
-
-				if ok && callback != nil {
-					bidPrice := 0.0
-					askPrice := 0.0
-					if len(msg.Tick.Bid) > 0 {
-						bidPrice = msg.Tick.Bid[0]
-					}
-					if len(msg.Tick.Ask) > 0 {
-						askPrice = msg.Tick.Ask[0]
-					}
-
-					callback(&Ticker{
-						Symbol:    symbol,
-						BidPrice:  bidPrice,
-						AskPrice:  askPrice,
-						LastPrice: msg.Tick.Close,
-						Timestamp: time.UnixMilli(msg.Ts),
-					})
+			if ok && callback != nil {
+				bidPrice := 0.0
+				askPrice := 0.0
+				if len(msg.Tick.Bid) > 0 {
+					bidPrice = msg.Tick.Bid[0]
 				}
+				if len(msg.Tick.Ask) > 0 {
+					askPrice = msg.Tick.Ask[0]
+				}
+
+				callback(&Ticker{
+					Symbol:    symbol,
+					BidPrice:  bidPrice,
+					AskPrice:  askPrice,
+					LastPrice: msg.Tick.Close,
+					Timestamp: time.UnixMilli(msg.Ts),
+				})
 			}
 		}
 	}
@@ -616,14 +602,15 @@ func (h *HTX) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 }
 
 func (h *HTX) Close() error {
-	close(h.closeChan)
+	select {
+	case <-h.closeChan:
+	default:
+		close(h.closeChan)
+	}
 
-	h.wsMu.Lock()
-	defer h.wsMu.Unlock()
-
-	if h.wsConn != nil {
-		h.wsConn.Close()
-		h.wsConn = nil
+	if h.wsManager != nil {
+		h.wsManager.Close()
+		h.wsManager = nil
 	}
 
 	h.connected = false

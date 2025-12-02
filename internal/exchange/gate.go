@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -29,8 +30,8 @@ type Gate struct {
 
 	httpClient *http.Client
 
-	wsConn   *websocket.Conn
-	wsMu     sync.RWMutex
+	// WebSocket manager с автоматическим переподключением
+	wsManager *WSReconnectManager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -400,16 +401,23 @@ func (g *Gate) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	g.tickerCallbacks[symbol] = callback
 	g.callbackMu.Unlock()
 
-	g.wsMu.Lock()
-	defer g.wsMu.Unlock()
+	if g.wsManager == nil {
+		config := DefaultWSReconnectConfig()
+		g.wsManager = NewWSReconnectManager("gate", gateWSURL, config)
 
-	if g.wsConn == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(gateWSURL, nil)
-		if err != nil {
+		g.wsManager.SetOnMessage(g.handleMessage)
+		g.wsManager.SetOnConnect(func() {
+			log.Printf("[gate] WebSocket connected")
+		})
+		g.wsManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[gate] WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := g.wsManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		g.wsConn = conn
-		go g.handleMessages()
 	}
 
 	contract := g.toGateSymbol(symbol)
@@ -420,67 +428,47 @@ func (g *Gate) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		"payload": []string{contract},
 	}
 
-	return g.wsConn.WriteJSON(subMsg)
+	g.wsManager.AddSubscription(subMsg)
+	return g.wsManager.Send(subMsg)
 }
 
-func (g *Gate) handleMessages() {
-	for {
-		select {
-		case <-g.closeChan:
-			return
-		default:
-		}
+// handleMessage обрабатывает одно сообщение из WebSocket
+func (g *Gate) handleMessage(message []byte) {
+	var msg struct {
+		Channel string `json:"channel"`
+		Event   string `json:"event"`
+		Result  []struct {
+			Contract   string `json:"contract"`
+			Last       string `json:"last"`
+			LowestAsk  string `json:"lowest_ask"`
+			HighestBid string `json:"highest_bid"`
+		} `json:"result"`
+	}
 
-		g.wsMu.RLock()
-		conn := g.wsConn
-		g.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if msg.Channel == "futures.tickers" && msg.Event == "update" {
+		for _, t := range msg.Result {
+			symbol := g.fromGateSymbol(t.Contract)
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+			g.callbackMu.RLock()
+			callback, ok := g.tickerCallbacks[symbol]
+			g.callbackMu.RUnlock()
 
-		var msg struct {
-			Channel string `json:"channel"`
-			Event   string `json:"event"`
-			Result  []struct {
-				Contract   string `json:"contract"`
-				Last       string `json:"last"`
-				LowestAsk  string `json:"lowest_ask"`
-				HighestBid string `json:"highest_bid"`
-			} `json:"result"`
-		}
+			if ok && callback != nil {
+				bidPrice, _ := strconv.ParseFloat(t.HighestBid, 64)
+				askPrice, _ := strconv.ParseFloat(t.LowestAsk, 64)
+				lastPrice, _ := strconv.ParseFloat(t.Last, 64)
 
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if msg.Channel == "futures.tickers" && msg.Event == "update" {
-			for _, t := range msg.Result {
-				symbol := g.fromGateSymbol(t.Contract)
-
-				g.callbackMu.RLock()
-				callback, ok := g.tickerCallbacks[symbol]
-				g.callbackMu.RUnlock()
-
-				if ok && callback != nil {
-					bidPrice, _ := strconv.ParseFloat(t.HighestBid, 64)
-					askPrice, _ := strconv.ParseFloat(t.LowestAsk, 64)
-					lastPrice, _ := strconv.ParseFloat(t.Last, 64)
-
-					callback(&Ticker{
-						Symbol:    symbol,
-						BidPrice:  bidPrice,
-						AskPrice:  askPrice,
-						LastPrice: lastPrice,
-						Timestamp: time.Now(),
-					})
-				}
+				callback(&Ticker{
+					Symbol:    symbol,
+					BidPrice:  bidPrice,
+					AskPrice:  askPrice,
+					LastPrice: lastPrice,
+					Timestamp: time.Now(),
+				})
 			}
 		}
 	}
@@ -491,24 +479,23 @@ func (g *Gate) SubscribePositions(callback func(*Position)) error {
 	g.positionCallback = callback
 	g.callbackMu.Unlock()
 
-	g.wsMu.Lock()
-	defer g.wsMu.Unlock()
+	if g.wsManager == nil {
+		config := DefaultWSReconnectConfig()
+		g.wsManager = NewWSReconnectManager("gate", gateWSURL, config)
 
-	if g.wsConn == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(gateWSURL, nil)
-		if err != nil {
+		g.wsManager.SetOnMessage(g.handleMessage)
+		g.wsManager.SetOnConnect(func() {
+			log.Printf("[gate] WebSocket connected")
+		})
+		g.wsManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[gate] WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := g.wsManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		g.wsConn = conn
-
-		// Authenticate
-		if err := g.authenticateWebSocket(conn); err != nil {
-			conn.Close()
-			g.wsConn = nil
-			return err
-		}
-
-		go g.handleMessages()
 	}
 
 	subMsg := map[string]interface{}{
@@ -523,7 +510,8 @@ func (g *Gate) SubscribePositions(callback func(*Position)) error {
 		},
 	}
 
-	return g.wsConn.WriteJSON(subMsg)
+	g.wsManager.AddSubscription(subMsg)
+	return g.wsManager.Send(subMsg)
 }
 
 func (g *Gate) authenticateWebSocket(conn *websocket.Conn) error {
@@ -583,14 +571,15 @@ func (g *Gate) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 }
 
 func (g *Gate) Close() error {
-	close(g.closeChan)
+	select {
+	case <-g.closeChan:
+	default:
+		close(g.closeChan)
+	}
 
-	g.wsMu.Lock()
-	defer g.wsMu.Unlock()
-
-	if g.wsConn != nil {
-		g.wsConn.Close()
-		g.wsConn = nil
+	if g.wsManager != nil {
+		g.wsManager.Close()
+		g.wsManager = nil
 	}
 
 	g.connected = false

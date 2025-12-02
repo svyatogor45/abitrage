@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,8 +16,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 const (
@@ -30,8 +29,8 @@ type BingX struct {
 
 	httpClient *http.Client
 
-	wsConn   *websocket.Conn
-	wsMu     sync.RWMutex
+	// WebSocket manager с автоматическим переподключением
+	wsManager *WSReconnectManager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -411,84 +410,71 @@ func (b *BingX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	b.tickerCallbacks[symbol] = callback
 	b.callbackMu.Unlock()
 
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
+	if b.wsManager == nil {
+		config := DefaultWSReconnectConfig()
+		b.wsManager = NewWSReconnectManager("bingx", bingxWSURL, config)
 
-	if b.wsConn == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(bingxWSURL, nil)
-		if err != nil {
+		b.wsManager.SetOnMessage(b.handleMessage)
+		b.wsManager.SetOnConnect(func() {
+			log.Printf("[bingx] WebSocket connected")
+		})
+		b.wsManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[bingx] WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := b.wsManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		b.wsConn = conn
-		go b.handleMessages()
 	}
 
 	bingxSymbol := b.toBingXSymbol(symbol)
 	subMsg := map[string]interface{}{
-		"id":     fmt.Sprintf("ticker_%s", symbol),
-		"reqType": "sub",
+		"id":       fmt.Sprintf("ticker_%s", symbol),
+		"reqType":  "sub",
 		"dataType": fmt.Sprintf("%s@ticker", bingxSymbol),
 	}
 
-	return b.wsConn.WriteJSON(subMsg)
+	b.wsManager.AddSubscription(subMsg)
+	return b.wsManager.Send(subMsg)
 }
 
-func (b *BingX) handleMessages() {
-	for {
-		select {
-		case <-b.closeChan:
-			return
-		default:
-		}
+// handleMessage обрабатывает одно сообщение из WebSocket
+func (b *BingX) handleMessage(message []byte) {
+	var msg struct {
+		DataType string `json:"dataType"`
+		Data     struct {
+			Symbol    string `json:"s"`
+			LastPrice string `json:"c"`
+			BidPrice  string `json:"b"`
+			AskPrice  string `json:"a"`
+		} `json:"data"`
+	}
 
-		b.wsMu.RLock()
-		conn := b.wsConn
-		b.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if strings.Contains(msg.DataType, "@ticker") {
+		symbol := b.fromBingXSymbol(msg.Data.Symbol)
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+		b.callbackMu.RLock()
+		callback, ok := b.tickerCallbacks[symbol]
+		b.callbackMu.RUnlock()
 
-		var msg struct {
-			DataType string `json:"dataType"`
-			Data     struct {
-				Symbol    string `json:"s"`
-				LastPrice string `json:"c"`
-				BidPrice  string `json:"b"`
-				AskPrice  string `json:"a"`
-			} `json:"data"`
-		}
+		if ok && callback != nil {
+			bidPrice, _ := strconv.ParseFloat(msg.Data.BidPrice, 64)
+			askPrice, _ := strconv.ParseFloat(msg.Data.AskPrice, 64)
+			lastPrice, _ := strconv.ParseFloat(msg.Data.LastPrice, 64)
 
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if strings.Contains(msg.DataType, "@ticker") {
-			symbol := b.fromBingXSymbol(msg.Data.Symbol)
-
-			b.callbackMu.RLock()
-			callback, ok := b.tickerCallbacks[symbol]
-			b.callbackMu.RUnlock()
-
-			if ok && callback != nil {
-				bidPrice, _ := strconv.ParseFloat(msg.Data.BidPrice, 64)
-				askPrice, _ := strconv.ParseFloat(msg.Data.AskPrice, 64)
-				lastPrice, _ := strconv.ParseFloat(msg.Data.LastPrice, 64)
-
-				callback(&Ticker{
-					Symbol:    symbol,
-					BidPrice:  bidPrice,
-					AskPrice:  askPrice,
-					LastPrice: lastPrice,
-					Timestamp: time.Now(),
-				})
-			}
+			callback(&Ticker{
+				Symbol:    symbol,
+				BidPrice:  bidPrice,
+				AskPrice:  askPrice,
+				LastPrice: lastPrice,
+				Timestamp: time.Now(),
+			})
 		}
 	}
 }
@@ -551,14 +537,15 @@ func (b *BingX) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 }
 
 func (b *BingX) Close() error {
-	close(b.closeChan)
+	select {
+	case <-b.closeChan:
+	default:
+		close(b.closeChan)
+	}
 
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
-
-	if b.wsConn != nil {
-		b.wsConn.Close()
-		b.wsConn = nil
+	if b.wsManager != nil {
+		b.wsManager.Close()
+		b.wsManager = nil
 	}
 
 	b.connected = false

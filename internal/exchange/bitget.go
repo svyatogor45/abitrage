@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -33,9 +34,9 @@ type Bitget struct {
 
 	httpClient *http.Client
 
-	wsPublic  *websocket.Conn
-	wsPrivate *websocket.Conn
-	wsMu      sync.RWMutex
+	// WebSocket managers с автоматическим переподключением
+	wsPublicManager  *WSReconnectManager
+	wsPrivateManager *WSReconnectManager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -480,16 +481,24 @@ func (b *Bitget) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	b.tickerCallbacks[symbol] = callback
 	b.callbackMu.Unlock()
 
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
+	// Создаём WSReconnectManager если ещё не создан
+	if b.wsPublicManager == nil {
+		config := DefaultWSReconnectConfig()
+		b.wsPublicManager = NewWSReconnectManager("bitget-public", bitgetWSPublic, config)
 
-	if b.wsPublic == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(bitgetWSPublic, nil)
-		if err != nil {
+		b.wsPublicManager.SetOnMessage(b.handlePublicMessage)
+		b.wsPublicManager.SetOnConnect(func() {
+			log.Printf("[bitget] Public WebSocket connected")
+		})
+		b.wsPublicManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[bitget] Public WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := b.wsPublicManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
-		b.wsPublic = conn
-		go b.handlePublicMessages()
 	}
 
 	subMsg := map[string]interface{}{
@@ -503,71 +512,51 @@ func (b *Bitget) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		},
 	}
 
-	return b.wsPublic.WriteJSON(subMsg)
+	b.wsPublicManager.AddSubscription(subMsg)
+	return b.wsPublicManager.Send(subMsg)
 }
 
-func (b *Bitget) handlePublicMessages() {
-	for {
-		select {
-		case <-b.closeChan:
-			return
-		default:
-		}
+// handlePublicMessage обрабатывает одно сообщение из публичного WebSocket
+func (b *Bitget) handlePublicMessage(message []byte) {
+	var msg struct {
+		Action string `json:"action"`
+		Arg    struct {
+			Channel string `json:"channel"`
+			InstId  string `json:"instId"`
+		} `json:"arg"`
+		Data []struct {
+			BidPr  string `json:"bidPr"`
+			AskPr  string `json:"askPr"`
+			LastPr string `json:"lastPr"`
+			Ts     string `json:"ts"`
+		} `json:"data"`
+	}
 
-		b.wsMu.RLock()
-		conn := b.wsPublic
-		b.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if msg.Arg.Channel == "ticker" && len(msg.Data) > 0 {
+		symbol := msg.Arg.InstId
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+		b.callbackMu.RLock()
+		callback, ok := b.tickerCallbacks[symbol]
+		b.callbackMu.RUnlock()
 
-		var msg struct {
-			Action string `json:"action"`
-			Arg    struct {
-				Channel string `json:"channel"`
-				InstId  string `json:"instId"`
-			} `json:"arg"`
-			Data []struct {
-				BidPr     string `json:"bidPr"`
-				AskPr     string `json:"askPr"`
-				LastPr    string `json:"lastPr"`
-				Ts        string `json:"ts"`
-			} `json:"data"`
-		}
+		if ok && callback != nil {
+			d := msg.Data[0]
+			bidPrice, _ := strconv.ParseFloat(d.BidPr, 64)
+			askPrice, _ := strconv.ParseFloat(d.AskPr, 64)
+			lastPrice, _ := strconv.ParseFloat(d.LastPr, 64)
+			ts, _ := strconv.ParseInt(d.Ts, 10, 64)
 
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if msg.Arg.Channel == "ticker" && len(msg.Data) > 0 {
-			symbol := msg.Arg.InstId
-
-			b.callbackMu.RLock()
-			callback, ok := b.tickerCallbacks[symbol]
-			b.callbackMu.RUnlock()
-
-			if ok && callback != nil {
-				d := msg.Data[0]
-				bidPrice, _ := strconv.ParseFloat(d.BidPr, 64)
-				askPrice, _ := strconv.ParseFloat(d.AskPr, 64)
-				lastPrice, _ := strconv.ParseFloat(d.LastPr, 64)
-				ts, _ := strconv.ParseInt(d.Ts, 10, 64)
-
-				callback(&Ticker{
-					Symbol:    symbol,
-					BidPrice:  bidPrice,
-					AskPrice:  askPrice,
-					LastPrice: lastPrice,
-					Timestamp: time.UnixMilli(ts),
-				})
-			}
+			callback(&Ticker{
+				Symbol:    symbol,
+				BidPrice:  bidPrice,
+				AskPrice:  askPrice,
+				LastPrice: lastPrice,
+				Timestamp: time.UnixMilli(ts),
+			})
 		}
 	}
 }
@@ -577,23 +566,25 @@ func (b *Bitget) SubscribePositions(callback func(*Position)) error {
 	b.positionCallback = callback
 	b.callbackMu.Unlock()
 
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
+	// Создаём WSReconnectManager если ещё не создан
+	if b.wsPrivateManager == nil {
+		config := DefaultWSReconnectConfig()
+		b.wsPrivateManager = NewWSReconnectManager("bitget-private", bitgetWSPrivate, config)
 
-	if b.wsPrivate == nil {
-		conn, _, err := websocket.DefaultDialer.Dial(bitgetWSPrivate, nil)
-		if err != nil {
+		b.wsPrivateManager.SetAuthFunc(b.authenticateWebSocket)
+		b.wsPrivateManager.SetOnMessage(b.handlePrivateMessage)
+		b.wsPrivateManager.SetOnConnect(func() {
+			log.Printf("[bitget] Private WebSocket connected")
+		})
+		b.wsPrivateManager.SetOnDisconnect(func(err error) {
+			if err != nil {
+				log.Printf("[bitget] Private WebSocket disconnected: %v", err)
+			}
+		})
+
+		if err := b.wsPrivateManager.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to private WebSocket: %w", err)
 		}
-		b.wsPrivate = conn
-
-		if err := b.authenticateWebSocket(conn); err != nil {
-			conn.Close()
-			b.wsPrivate = nil
-			return err
-		}
-
-		go b.handlePrivateMessages()
 	}
 
 	subMsg := map[string]interface{}{
@@ -607,7 +598,8 @@ func (b *Bitget) SubscribePositions(callback func(*Position)) error {
 		},
 	}
 
-	return b.wsPrivate.WriteJSON(subMsg)
+	b.wsPrivateManager.AddSubscription(subMsg)
+	return b.wsPrivateManager.Send(subMsg)
 }
 
 func (b *Bitget) authenticateWebSocket(conn *websocket.Conn) error {
@@ -654,79 +646,58 @@ func (b *Bitget) authenticateWebSocket(conn *websocket.Conn) error {
 	return nil
 }
 
-func (b *Bitget) handlePrivateMessages() {
-	for {
-		select {
-		case <-b.closeChan:
-			return
-		default:
-		}
+// handlePrivateMessage обрабатывает одно сообщение из приватного WebSocket
+func (b *Bitget) handlePrivateMessage(message []byte) {
+	var msg struct {
+		Arg struct {
+			Channel string `json:"channel"`
+		} `json:"arg"`
+		Data []struct {
+			InstId       string `json:"instId"`
+			HoldSide     string `json:"holdSide"`
+			Total        string `json:"total"`
+			OpenPriceAvg string `json:"openPriceAvg"`
+			MarkPrice    string `json:"markPrice"`
+			Leverage     string `json:"leverage"`
+			UnrealizedPL string `json:"unrealizedPL"`
+			UTime        string `json:"uTime"`
+		} `json:"data"`
+	}
 
-		b.wsMu.RLock()
-		conn := b.wsPrivate
-		b.wsMu.RUnlock()
+	if err := json.Unmarshal(message, &msg); err != nil {
+		return
+	}
 
-		if conn == nil {
-			return
-		}
+	if msg.Arg.Channel == "positions" {
+		b.callbackMu.RLock()
+		callback := b.positionCallback
+		b.callbackMu.RUnlock()
 
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
+		if callback != nil {
+			for _, p := range msg.Data {
+				size, _ := strconv.ParseFloat(p.Total, 64)
+				entryPrice, _ := strconv.ParseFloat(p.OpenPriceAvg, 64)
+				markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
+				leverage, _ := strconv.Atoi(p.Leverage)
+				unrealizedPnl, _ := strconv.ParseFloat(p.UnrealizedPL, 64)
+				uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
 
-		var msg struct {
-			Arg struct {
-				Channel string `json:"channel"`
-			} `json:"arg"`
-			Data []struct {
-				InstId       string `json:"instId"`
-				HoldSide     string `json:"holdSide"`
-				Total        string `json:"total"`
-				OpenPriceAvg string `json:"openPriceAvg"`
-				MarkPrice    string `json:"markPrice"`
-				Leverage     string `json:"leverage"`
-				UnrealizedPL string `json:"unrealizedPL"`
-				UTime        string `json:"uTime"`
-			} `json:"data"`
-		}
-
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
-
-		if msg.Arg.Channel == "positions" {
-			b.callbackMu.RLock()
-			callback := b.positionCallback
-			b.callbackMu.RUnlock()
-
-			if callback != nil {
-				for _, p := range msg.Data {
-					size, _ := strconv.ParseFloat(p.Total, 64)
-					entryPrice, _ := strconv.ParseFloat(p.OpenPriceAvg, 64)
-					markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-					leverage, _ := strconv.Atoi(p.Leverage)
-					unrealizedPnl, _ := strconv.ParseFloat(p.UnrealizedPL, 64)
-					uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
-
-					side := SideLong
-					if p.HoldSide == "short" {
-						side = SideShort
-					}
-
-					callback(&Position{
-						Symbol:        p.InstId,
-						Side:          side,
-						Size:          size,
-						EntryPrice:    entryPrice,
-						MarkPrice:     markPrice,
-						Leverage:      leverage,
-						UnrealizedPnl: unrealizedPnl,
-						Liquidation:   false,
-						UpdatedAt:     time.UnixMilli(uTime),
-					})
+				side := SideLong
+				if p.HoldSide == "short" {
+					side = SideShort
 				}
+
+				callback(&Position{
+					Symbol:        p.InstId,
+					Side:          side,
+					Size:          size,
+					EntryPrice:    entryPrice,
+					MarkPrice:     markPrice,
+					Leverage:      leverage,
+					UnrealizedPnl: unrealizedPnl,
+					Liquidation:   false,
+					UpdatedAt:     time.UnixMilli(uTime),
+				})
 			}
 		}
 	}
@@ -798,19 +769,20 @@ func (b *Bitget) GetLimits(ctx context.Context, symbol string) (*Limits, error) 
 }
 
 func (b *Bitget) Close() error {
-	close(b.closeChan)
-
-	b.wsMu.Lock()
-	defer b.wsMu.Unlock()
-
-	if b.wsPublic != nil {
-		b.wsPublic.Close()
-		b.wsPublic = nil
+	select {
+	case <-b.closeChan:
+	default:
+		close(b.closeChan)
 	}
 
-	if b.wsPrivate != nil {
-		b.wsPrivate.Close()
-		b.wsPrivate = nil
+	if b.wsPublicManager != nil {
+		b.wsPublicManager.Close()
+		b.wsPublicManager = nil
+	}
+
+	if b.wsPrivateManager != nil {
+		b.wsPrivateManager.Close()
+		b.wsPrivateManager = nil
 	}
 
 	b.connected = false
