@@ -104,13 +104,17 @@ func main() {
 	// Настройка HTTP роутера
 	router := api.SetupRoutes(deps)
 
-	// HTTP сервер
+	// HTTP сервер с конфигурируемыми таймаутами
+	// Таймауты можно переопределить через переменные окружения:
+	// - SERVER_READ_TIMEOUT (default: 15s)
+	// - SERVER_WRITE_TIMEOUT (default: 15s)
+	// - SERVER_IDLE_TIMEOUT (default: 60s)
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 		Handler:      router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  cfg.Server.ReadTimeout,
+		WriteTimeout: cfg.Server.WriteTimeout,
+		IdleTimeout:  cfg.Server.IdleTimeout,
 	}
 
 	// Запуск сервера в отдельной горутине

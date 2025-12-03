@@ -18,11 +18,14 @@ type Config struct {
 
 // ServerConfig - настройки HTTP сервера
 type ServerConfig struct {
-	Port     int
-	Host     string
-	UseHTTPS bool
-	CertFile string
-	KeyFile  string
+	Port         int
+	Host         string
+	UseHTTPS     bool
+	CertFile     string
+	KeyFile      string
+	ReadTimeout  time.Duration // таймаут чтения запроса
+	WriteTimeout time.Duration // таймаут записи ответа
+	IdleTimeout  time.Duration // таймаут keep-alive соединений
 }
 
 // DatabaseConfig - настройки подключения к БД
@@ -73,11 +76,14 @@ type LoggingConfig struct {
 func Load() (*Config, error) {
 	cfg := &Config{
 		Server: ServerConfig{
-			Port:     getEnvAsInt("SERVER_PORT", 8080),
-			Host:     getEnv("SERVER_HOST", "0.0.0.0"),
-			UseHTTPS: getEnvAsBool("USE_HTTPS", false),
-			CertFile: getEnv("CERT_FILE", ""),
-			KeyFile:  getEnv("KEY_FILE", ""),
+			Port:         getEnvAsInt("SERVER_PORT", 8080),
+			Host:         getEnv("SERVER_HOST", "0.0.0.0"),
+			UseHTTPS:     getEnvAsBool("USE_HTTPS", false),
+			CertFile:     getEnv("CERT_FILE", ""),
+			KeyFile:      getEnv("KEY_FILE", ""),
+			ReadTimeout:  getEnvAsDuration("SERVER_READ_TIMEOUT", 15*time.Second),
+			WriteTimeout: getEnvAsDuration("SERVER_WRITE_TIMEOUT", 15*time.Second),
+			IdleTimeout:  getEnvAsDuration("SERVER_IDLE_TIMEOUT", 60*time.Second),
 		},
 		Database: DatabaseConfig{
 			Driver:   getEnv("DB_DRIVER", "postgres"),
