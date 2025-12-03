@@ -1,27 +1,63 @@
+# =============================================================================
+# Docker Compose Configuration for Arbitrage Bot
+# =============================================================================
+#
+# Использование:
+#   1. Скопировать .env.example в .env и настроить параметры
+#   2. docker-compose up -d
+#
+# Production:
+#   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# =============================================================================
+
 version: '3.8'
 
 services:
+  # ===========================================================================
   # PostgreSQL база данных
+  # ===========================================================================
   db:
     image: postgres:15-alpine
     container_name: arbitrage-db
+    env_file:
+      - .env
     environment:
-      POSTGRES_DB: arbitrage
-      POSTGRES_USER: arbitrage_user
-      POSTGRES_PASSWORD: arbitrage_password
+      POSTGRES_DB: ${DB_NAME:-arbitrage}
+      POSTGRES_USER: ${DB_USER:-arbitrage_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      # Только localhost для безопасности (закомментировать в production)
+      - "127.0.0.1:5432:5432"
     networks:
       - arbitrage-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U arbitrage_user -d arbitrage"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-arbitrage_user} -d ${DB_NAME:-arbitrage}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+    # Лимиты ресурсов
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    # Log rotation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  # ===========================================================================
   # Backend приложение (Go)
+  # ===========================================================================
   app:
     build:
       context: .
@@ -30,45 +66,47 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # Все секреты загружаются из .env файла
+    env_file:
+      - .env
     environment:
-      # Server
-      SERVER_PORT: 8080
-      SERVER_HOST: 0.0.0.0
-      USE_HTTPS: "false"
-
-      # Database
-      DB_DRIVER: postgres
+      # Database connection (используем имя сервиса как хост)
       DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: arbitrage
-      DB_USER: arbitrage_user
-      DB_PASSWORD: arbitrage_password
-      DB_SSL_MODE: disable
-
-      # Security (ВАЖНО: изменить в production!)
-      JWT_SECRET: change-me-in-production-very-long-secret-key
-      ENCRYPTION_KEY: 12345678901234567890123456789012  # 32 байта для AES-256
-
-      # Bot
-      UPDATE_INTERVAL: 1s
-      BALANCE_UPDATE_FREQ: 1m
-      MAX_RETRIES: 4
-      RETRY_BACKOFF: 2s
-
-      # Logging
-      LOG_LEVEL: info
-      LOG_FORMAT: json
+      # Явно указываем production режим если нужно
+      # ENV: production
     ports:
       - "8080:8080"
     networks:
       - arbitrage-network
     restart: unless-stopped
     volumes:
-      - ./logs:/root/logs
+      - ./logs:/app/logs
+    # Healthcheck для определения готовности
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Лимиты ресурсов
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    # Log rotation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
 
-  # ============================================================
+  # ===========================================================================
   # Мониторинг: Prometheus
-  # ============================================================
+  # ===========================================================================
   # Сбор и хранение метрик торгового ядра
   # UI: http://localhost:9090
   prometheus:
@@ -84,16 +122,30 @@ services:
       - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     networks:
       - arbitrage-network
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # ============================================================
+  # ===========================================================================
   # Мониторинг: Alertmanager
-  # ============================================================
+  # ===========================================================================
   # Обработка и маршрутизация алертов
   # UI: http://localhost:9093
   alertmanager:
@@ -106,33 +158,63 @@ services:
       - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager_data:/alertmanager
     ports:
-      - "9093:9093"
+      - "127.0.0.1:9093:9093"
     networks:
       - arbitrage-network
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  # ============================================================
-  # Мониторинг: Grafana (опционально)
-  # ============================================================
+  # ===========================================================================
+  # Мониторинг: Grafana
+  # ===========================================================================
   # Визуализация метрик и дашборды
-  # UI: http://localhost:3001 (admin/admin)
+  # UI: http://localhost:3001
+  # Credentials: из переменных окружения GRAFANA_USER/GRAFANA_PASSWORD
   grafana:
     image: grafana/grafana:10.1.0
     container_name: arbitrage-grafana
+    env_file:
+      - .env
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?GRAFANA_PASSWORD is required}
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3001
     volumes:
       - grafana_data:/var/lib/grafana
     ports:
-      - "3001:3000"
+      - "127.0.0.1:3001:3000"
     networks:
       - arbitrage-network
     depends_on:
       - prometheus
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+# =============================================================================
+# Volumes
+# =============================================================================
 volumes:
   postgres_data:
     driver: local
@@ -143,6 +225,12 @@ volumes:
   grafana_data:
     driver: local
 
+# =============================================================================
+# Networks
+# =============================================================================
 networks:
   arbitrage-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
