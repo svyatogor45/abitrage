@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useMemo } from 'react';
 import { exchangesApi } from '@/services/api';
 import { websocketService } from '@/services/websocket';
 import type {
@@ -16,11 +16,11 @@ const EXCHANGES_QUERY_KEY = ['exchanges'];
  */
 export function useExchanges() {
   const queryClient = useQueryClient();
-  const [balances, setBalances] = useState<Map<ExchangeName, number>>(
-    new Map()
-  );
 
-  // Запрос списка бирж
+  // Ref для хранения WebSocket балансов (не вызывает ре-рендер)
+  const wsBalancesRef = useRef<Map<ExchangeName, number>>(new Map());
+
+  // Запрос списка бирж с отключённым retry при ошибках
   const {
     data: exchanges = [],
     isLoading,
@@ -30,54 +30,30 @@ export function useExchanges() {
     queryKey: EXCHANGES_QUERY_KEY,
     queryFn: exchangesApi.getAll,
     staleTime: 60000, // 1 минута
+    retry: false, // Отключаем retry чтобы избежать бесконечного цикла
+    refetchOnWindowFocus: false,
   });
 
   // Подписка на обновления балансов через WebSocket
   useEffect(() => {
     const unsubscribe = websocketService.onBalanceUpdate(
       (update: BalanceUpdateMessage) => {
-        setBalances((prev) => {
-          const newMap = new Map(prev);
-          newMap.set(update.exchange, update.balance);
-          return newMap;
-        });
+        wsBalancesRef.current.set(update.exchange, update.balance);
+        // Инвалидируем кэш чтобы обновить UI
+        queryClient.invalidateQueries({ queryKey: EXCHANGES_QUERY_KEY });
       }
     );
 
     return unsubscribe;
-  }, []);
+  }, [queryClient]);
 
-  // Инициализация балансов из начальных данных
-  useEffect(() => {
-    // Только обновляем если есть данные и они отличаются
-    if (exchanges.length === 0) return;
-
-    setBalances((prev) => {
-      const newBalances = new Map<ExchangeName, number>();
-      exchanges.forEach((exchange) => {
-        if (exchange.connected) {
-          newBalances.set(exchange.name, exchange.balance);
-        }
-      });
-
-      // Проверяем, изменились ли данные
-      if (prev.size === newBalances.size) {
-        let equal = true;
-        prev.forEach((value, key) => {
-          if (newBalances.get(key) !== value) equal = false;
-        });
-        if (equal) return prev; // Возвращаем старый Map если данные не изменились
-      }
-
-      return newBalances;
-    });
+  // Комбинирование данных бирж с актуальными балансами (без useEffect!)
+  const exchangesWithBalances: ExchangeAccount[] = useMemo(() => {
+    return exchanges.map((exchange) => ({
+      ...exchange,
+      balance: wsBalancesRef.current.get(exchange.name) ?? exchange.balance,
+    }));
   }, [exchanges]);
-
-  // Комбинирование данных бирж с актуальными балансами
-  const exchangesWithBalances: ExchangeAccount[] = exchanges.map((exchange) => ({
-    ...exchange,
-    balance: balances.get(exchange.name) ?? exchange.balance,
-  }));
 
   // Мутация подключения биржи
   const connectMutation = useMutation({
@@ -105,11 +81,8 @@ export function useExchanges() {
   const refreshBalanceMutation = useMutation({
     mutationFn: (name: ExchangeName) => exchangesApi.refreshBalance(name),
     onSuccess: (data) => {
-      setBalances((prev) => {
-        const newMap = new Map(prev);
-        newMap.set(data.name, data.balance);
-        return newMap;
-      });
+      wsBalancesRef.current.set(data.name, data.balance);
+      queryClient.invalidateQueries({ queryKey: EXCHANGES_QUERY_KEY });
     },
   });
 
