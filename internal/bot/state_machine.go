@@ -7,7 +7,7 @@ var ValidTransitions = map[string][]string{
 	models.StatePaused:   {models.StateReady},
 	models.StateReady:    {models.StatePaused, models.StateEntering},
 	models.StateEntering: {models.StateHolding, models.StateReady, models.StateError}, // Ready при откате
-	models.StateHolding:  {models.StateExiting, models.StateError},                    // Error при ликвидации
+	models.StateHolding:  {models.StateExiting, models.StatePaused, models.StateError}, // PAUSED при SL/ликвидации
 	models.StateExiting:  {models.StateReady, models.StatePaused, models.StateError},
 	models.StateError:    {models.StatePaused}, // Только ручной сброс
 }
