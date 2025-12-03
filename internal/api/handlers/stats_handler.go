@@ -23,11 +23,11 @@ import (
 // - Количество ликвидаций с деталями
 // - Топ-5 пар по разным метрикам
 type StatsHandler struct {
-	statsService *service.StatsService
+	statsService service.StatsServiceInterface
 }
 
 // NewStatsHandler создает новый StatsHandler с внедрением зависимостей.
-func NewStatsHandler(statsService *service.StatsService) *StatsHandler {
+func NewStatsHandler(statsService service.StatsServiceInterface) *StatsHandler {
 	return &StatsHandler{
 		statsService: statsService,
 	}

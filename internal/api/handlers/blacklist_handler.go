@@ -22,11 +22,11 @@ import (
 // Черный список носит ИНФОРМАТИВНЫЙ характер - это заметки пользователя
 // о нежелательных парах. Бот НЕ фильтрует автоматически на основе этого списка.
 type BlacklistHandler struct {
-	blacklistService *service.BlacklistService
+	blacklistService service.BlacklistServiceInterface
 }
 
 // NewBlacklistHandler создает новый BlacklistHandler с внедрением зависимостей.
-func NewBlacklistHandler(blacklistService *service.BlacklistService) *BlacklistHandler {
+func NewBlacklistHandler(blacklistService service.BlacklistServiceInterface) *BlacklistHandler {
 	return &BlacklistHandler{
 		blacklistService: blacklistService,
 	}

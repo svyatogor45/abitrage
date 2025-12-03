@@ -23,11 +23,11 @@ import (
 // обеспечивает пагинацию (по умолчанию 100 событий),
 // позволяет очищать историю уведомлений
 type NotificationHandler struct {
-	notificationService *service.NotificationService
+	notificationService service.NotificationServiceInterface
 }
 
 // NewNotificationHandler создает новый NotificationHandler с внедрением зависимости
-func NewNotificationHandler(notificationService *service.NotificationService) *NotificationHandler {
+func NewNotificationHandler(notificationService service.NotificationServiceInterface) *NotificationHandler {
 	return &NotificationHandler{
 		notificationService: notificationService,
 	}
