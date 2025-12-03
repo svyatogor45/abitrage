@@ -1,0 +1,86 @@
+# =============================================================================
+# Docker Build Ignore File
+# =============================================================================
+# Исключает ненужные файлы из Docker контекста для ускорения сборки
+# и уменьшения размера контекста.
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment files (секреты!)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Документация
+*.md
+!README.md
+docs/
+
+# Тесты
+tests/
+*_test.go
+coverage.out
+coverage.html
+
+# Frontend (собирается отдельно)
+frontend/
+web/
+
+# Логи
+logs/
+*.log
+
+# Временные файлы
+tmp/
+temp/
+.tmp/
+
+# Build артефакты
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Docker
+Dockerfile*
+docker-compose*.yml
+.docker/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+Jenkinsfile
+
+# Мониторинг конфигов (монтируются как volumes)
+monitoring/
+
+# Миграции копируются отдельно в Dockerfile
+# migrations/
+
+# Бенчмарки
+benchmarks/
+*.bench
+
+# Профили
+*.pprof
+*.prof
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
