@@ -49,13 +49,28 @@ export function useExchanges() {
 
   // Инициализация балансов из начальных данных
   useEffect(() => {
-    const newBalances = new Map<ExchangeName, number>();
-    exchanges.forEach((exchange) => {
-      if (exchange.connected) {
-        newBalances.set(exchange.name, exchange.balance);
+    // Только обновляем если есть данные и они отличаются
+    if (exchanges.length === 0) return;
+
+    setBalances((prev) => {
+      const newBalances = new Map<ExchangeName, number>();
+      exchanges.forEach((exchange) => {
+        if (exchange.connected) {
+          newBalances.set(exchange.name, exchange.balance);
+        }
+      });
+
+      // Проверяем, изменились ли данные
+      if (prev.size === newBalances.size) {
+        let equal = true;
+        prev.forEach((value, key) => {
+          if (newBalances.get(key) !== value) equal = false;
+        });
+        if (equal) return prev; // Возвращаем старый Map если данные не изменились
       }
+
+      return newBalances;
     });
-    setBalances(newBalances);
   }, [exchanges]);
 
   // Комбинирование данных бирж с актуальными балансами
