@@ -72,15 +72,15 @@ services:
     image: node:18-alpine
     container_name: arbitrage-frontend
     working_dir: /app
-    command: sh -c "npm install && npm start"
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     volumes:
       - ./frontend:/app
       - /app/node_modules
     ports:
       - "3000:3000"
     environment:
-      - REACT_APP_API_URL=http://localhost:8080
-      - REACT_APP_WS_URL=ws://localhost:8080/ws/stream
+      - VITE_BACKEND_URL=http://app:8080
+      - VITE_BACKEND_WS=ws://app:8080
     networks:
       - arbitrage-network
     depends_on:
