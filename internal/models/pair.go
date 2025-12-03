@@ -1,6 +1,9 @@
 package models
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // PairConfig представляет конфигурацию торговой пары
 type PairConfig struct {
@@ -25,3 +28,43 @@ const (
 	PairStatusPaused = "paused"
 	PairStatusActive = "active"
 )
+
+// Validate проверяет корректность параметров пары
+func (p *PairConfig) Validate() error {
+	if p.Symbol == "" {
+		return fmt.Errorf("symbol is required")
+	}
+	if p.Base == "" {
+		return fmt.Errorf("base currency is required")
+	}
+	if p.Quote == "" {
+		return fmt.Errorf("quote currency is required")
+	}
+	if p.EntrySpreadPct <= 0 {
+		return fmt.Errorf("entry_spread must be positive, got %f", p.EntrySpreadPct)
+	}
+	if p.ExitSpreadPct < 0 {
+		return fmt.Errorf("exit_spread cannot be negative, got %f", p.ExitSpreadPct)
+	}
+	if p.ExitSpreadPct >= p.EntrySpreadPct {
+		return fmt.Errorf("exit_spread (%f) must be less than entry_spread (%f)", p.ExitSpreadPct, p.EntrySpreadPct)
+	}
+	if p.VolumeAsset <= 0 {
+		return fmt.Errorf("volume must be positive, got %f", p.VolumeAsset)
+	}
+	if p.NOrders < 1 {
+		return fmt.Errorf("n_orders must be at least 1, got %d", p.NOrders)
+	}
+	if p.StopLoss < 0 {
+		return fmt.Errorf("stop_loss cannot be negative, got %f", p.StopLoss)
+	}
+	if p.Status != "" && p.Status != PairStatusPaused && p.Status != PairStatusActive {
+		return fmt.Errorf("invalid status: %s, must be '%s' or '%s'", p.Status, PairStatusPaused, PairStatusActive)
+	}
+	return nil
+}
+
+// IsActive возвращает true если пара активна
+func (p *PairConfig) IsActive() bool {
+	return p.Status == PairStatusActive
+}
