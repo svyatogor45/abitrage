@@ -151,15 +151,11 @@ func main() {
 
 // initDatabase создает подключение к базе данных
 func initDatabase(cfg *config.Config) (*sql.DB, error) {
-	dsn := fmt.Sprintf(
-		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
-		cfg.Database.Host,
-		cfg.Database.Port,
-		cfg.Database.User,
-		cfg.Database.Password,
-		cfg.Database.Name,
-		cfg.Database.SSLMode,
-	)
+	// Используем DSN helper из config
+	dsn := cfg.Database.DSN()
+
+	// Логируем DSN без пароля для отладки
+	log.Printf("Connecting to database: %s", cfg.Database.DSNWithoutPassword())
 
 	db, err := sql.Open(cfg.Database.Driver, dsn)
 	if err != nil {
