@@ -19,11 +19,11 @@ import (
 // - consider_funding: учитывать ли фандинг-рейты (future feature)
 // - notification_prefs: настройки отображения типов уведомлений
 type SettingsHandler struct {
-	settingsService *service.SettingsService
+	settingsService service.SettingsServiceInterface
 }
 
 // NewSettingsHandler создает новый SettingsHandler с внедрением зависимостей.
-func NewSettingsHandler(settingsService *service.SettingsService) *SettingsHandler {
+func NewSettingsHandler(settingsService service.SettingsServiceInterface) *SettingsHandler {
 	return &SettingsHandler{
 		settingsService: settingsService,
 	}

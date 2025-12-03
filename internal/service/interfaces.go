@@ -98,3 +98,48 @@ var _ NotificationRepositoryInterface = (*repository.NotificationRepository)(nil
 var _ StatsRepositoryInterface = (*repository.StatsRepository)(nil)
 var _ PairRepositoryInterface = (*repository.PairRepository)(nil)
 var _ ExchangeRepositoryInterface = (*repository.ExchangeRepository)(nil)
+
+// ============ Интерфейсы сервисов для Dependency Injection ============
+
+// BlacklistServiceInterface определяет интерфейс сервиса черного списка
+type BlacklistServiceInterface interface {
+	AddToBlacklist(symbol, reason string) (*models.BlacklistEntry, error)
+	GetBlacklist() ([]*models.BlacklistEntry, error)
+	RemoveFromBlacklist(symbol string) error
+	GetBySymbol(symbol string) (*models.BlacklistEntry, error)
+	IsBlacklisted(symbol string) (bool, error)
+	UpdateReason(symbol, reason string) error
+	Search(query string) ([]*models.BlacklistEntry, error)
+	GetCount() (int, error)
+	ClearAll() error
+}
+
+// SettingsServiceInterface определяет интерфейс сервиса настроек
+type SettingsServiceInterface interface {
+	GetSettings() (*models.Settings, error)
+	UpdateSettings(req *UpdateSettingsRequest) (*models.Settings, error)
+	GetNotificationPrefs() (*models.NotificationPreferences, error)
+	GetMaxConcurrentTrades() (*int, error)
+	ResetToDefaults() error
+}
+
+// NotificationServiceInterface определяет интерфейс сервиса уведомлений
+type NotificationServiceInterface interface {
+	GetNotifications(types []string, limit int) ([]*models.Notification, error)
+	ClearNotifications() error
+	CreateNotification(notif *models.Notification) error
+	GetNotificationCount() (int, error)
+}
+
+// StatsServiceInterface определяет интерфейс сервиса статистики
+type StatsServiceInterface interface {
+	GetStats() (*models.Stats, error)
+	GetTopPairs(metric string, limit int) ([]models.PairStat, error)
+	ResetStats() error
+}
+
+// Проверяем, что реальные сервисы реализуют интерфейсы
+var _ BlacklistServiceInterface = (*BlacklistService)(nil)
+var _ SettingsServiceInterface = (*SettingsService)(nil)
+var _ NotificationServiceInterface = (*NotificationService)(nil)
+var _ StatsServiceInterface = (*StatsService)(nil)
