@@ -1,7 +1,6 @@
 package middleware
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"runtime/debug"
@@ -16,9 +15,9 @@ import (
 //
 // Функции:
 // - Перехват panic в любом handler
-// - Логирование сообщения об ошибке
-// - Логирование полного stack trace
-// - Возврат 500 Internal Server Error клиенту
+// - Логирование сообщения об ошибке (только в логи сервера)
+// - Логирование полного stack trace (только в логи сервера)
+// - Возврат 500 Internal Server Error клиенту (без деталей для безопасности)
 // - Предотвращение падения сервера
 // - Продолжение обработки последующих запросов
 //
@@ -27,32 +26,27 @@ import (
 // Даже если в коде есть необработанная ошибка, сервер продолжит работу.
 // Помогает обнаружить и исправить баги через логи.
 //
+// Безопасность:
+// Клиенту возвращается только общее сообщение "Internal Server Error"
+// без раскрытия внутренних деталей ошибки (предотвращение утечки информации).
+//
 // Stack trace содержит:
 // - Последовательность вызовов функций до panic
 // - Номера строк кода
 // - Имена файлов
-// - Полезно для отладки
+// - Полезно для отладки (только в серверных логах)
 func Recovery(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				// TODO:
-				// 1. Захватить panic
-				// 2. Получить stack trace через debug.Stack()
-				// 3. Залогировать ошибку и stack trace
-				// 4. Вернуть 500 Internal Server Error клиенту
-				// 5. Опционально: отправить уведомление (email, Slack, Sentry)
-
-				// Логирование panic
-				log.Printf("PANIC: %v\n", err)
+				// Логирование panic (только на сервере, не отправляется клиенту)
+				log.Printf("PANIC recovered: %v", err)
+				log.Printf("Request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 				log.Printf("Stack trace:\n%s", debug.Stack())
 
-				// Возврат ошибки клиенту
-				http.Error(
-					w,
-					fmt.Sprintf("Internal Server Error: %v", err),
-					http.StatusInternalServerError,
-				)
+				// Возврат ошибки клиенту БЕЗ раскрытия деталей (для безопасности)
+				// Детали ошибки остаются только в логах сервера
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 		}()
 

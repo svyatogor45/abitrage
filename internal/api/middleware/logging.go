@@ -63,13 +63,16 @@ func Logging(next http.Handler) http.Handler {
 		next.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start)
+
+		// Формат лога: METHOD /path - status - duration - client_ip - response_size
 		log.Printf(
-			"%s %s - %d - %v - %s",
+			"%s %s - %d - %v - %s - %d bytes",
 			r.Method,
 			r.URL.Path,
 			wrapped.statusCode,
 			duration,
 			r.RemoteAddr,
+			wrapped.written,
 		)
 	})
 }

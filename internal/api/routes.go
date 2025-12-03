@@ -192,7 +192,10 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	// ============================================================
 	// pprof endpoints для профилирования
 	// ============================================================
-	// ВАЖНО: В production должны быть защищены авторизацией!
+	// ЗАЩИЩЕНО: Требуется Basic Auth (DEBUG_USERNAME/DEBUG_PASSWORD)
+	// В development без настроенных credentials доступ разрешен.
+	// В production (ENV=production) без credentials доступ запрещен.
+	//
 	// Используются для анализа производительности и отладки:
 	// - /debug/pprof/         - индекс всех профилей
 	// - /debug/pprof/profile  - CPU профиль (30 сек по умолчанию)
@@ -201,10 +204,11 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	// - /debug/pprof/trace    - execution trace
 	//
 	// Пример использования:
-	// go tool pprof http://localhost:8080/debug/pprof/profile
-	// go tool pprof http://localhost:8080/debug/pprof/heap
+	// go tool pprof http://admin:password@localhost:8080/debug/pprof/profile
+	// go tool pprof http://admin:password@localhost:8080/debug/pprof/heap
 
 	debug := router.PathPrefix("/debug/pprof").Subrouter()
+	debug.Use(middleware.DebugAuth) // Защита debug endpoints
 
 	debug.HandleFunc("/", pprof.Index)
 	debug.HandleFunc("/cmdline", pprof.Cmdline)
@@ -233,7 +237,10 @@ func SetupRoutes(deps *Dependencies) *mux.Router {
 	})
 
 	// Runtime stats endpoint (дополнительно)
-	router.HandleFunc("/debug/runtime", func(w http.ResponseWriter, r *http.Request) {
+	// Также защищен DebugAuth middleware
+	debugRuntime := router.PathPrefix("/debug/runtime").Subrouter()
+	debugRuntime.Use(middleware.DebugAuth)
+	debugRuntime.HandleFunc("", func(w http.ResponseWriter, r *http.Request) {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 
@@ -273,17 +280,29 @@ func itoa(i int) string {
 	return string(b[pos:])
 }
 
+// ftoa форматирует float64 с 2 знаками после запятой.
+// Корректно обрабатывает отрицательные числа, включая -1 < f < 0.
 func ftoa(f float64) string {
-	// Простое форматирование с 2 знаками после запятой
-	i := int(f * 100)
+	// Обрабатываем знак отдельно для корректной работы с числами -1 < f < 0
+	neg := f < 0
+	if neg {
+		f = -f
+	}
+
+	// Округляем до 2 знаков после запятой
+	i := int(f*100 + 0.5) // +0.5 для округления
 	whole := i / 100
 	frac := i % 100
-	if frac < 0 {
-		frac = -frac
-	}
+
+	// Формируем дробную часть с ведущим нулём
 	fracStr := itoa(frac)
 	if len(fracStr) == 1 {
 		fracStr = "0" + fracStr
 	}
-	return itoa(whole) + "." + fracStr
+
+	result := itoa(whole) + "." + fracStr
+	if neg {
+		result = "-" + result
+	}
+	return result
 }
