@@ -17,7 +17,7 @@ import type {
 } from '@/types';
 
 // Базовый URL API
-const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '/api/v1';
 
 // Создание axios инстанса
 const apiClient: AxiosInstance = axios.create({
