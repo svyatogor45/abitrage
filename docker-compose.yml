@@ -66,26 +66,6 @@ services:
     volumes:
       - ./logs:/root/logs
 
-  # Frontend (React) - для development
-  # В production лучше использовать nginx для статики
-  frontend:
-    image: node:18-alpine
-    container_name: arbitrage-frontend
-    working_dir: /app
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
-    ports:
-      - "3000:3000"
-    environment:
-      - VITE_BACKEND_URL=http://app:8080
-      - VITE_BACKEND_WS=ws://app:8080
-    networks:
-      - arbitrage-network
-    depends_on:
-      - app
-
   # ============================================================
   # Мониторинг: Prometheus
   # ============================================================
