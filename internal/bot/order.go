@@ -11,6 +11,7 @@ import (
 	"arbitrage/internal/exchange"
 	"arbitrage/internal/models"
 	"arbitrage/pkg/retry"
+	"arbitrage/pkg/utils"
 )
 
 // ============ ОПТИМИЗАЦИЯ: Object Pool для каналов LegResult ============
@@ -589,21 +590,15 @@ func (ov *OrderValidator) ValidateBothLegs(
 }
 
 // roundToStep округляет значение до ближайшего кратного step (в меньшую сторону)
+// Делегирует в utils.RoundToLotSize для единообразия
 func (ov *OrderValidator) roundToStep(value, step float64) float64 {
-	if step <= 0 {
-		return value
-	}
-
-	// Округляем вниз до кратного step
-	return float64(int64(value/step)) * step
+	return utils.RoundToLotSize(value, step)
 }
 
 // RoundToLotSize публичная функция для округления до lot size
+// Обёртка над utils.RoundToLotSize для обратной совместимости
 func RoundToLotSize(value, lotSize float64) float64 {
-	if lotSize <= 0 {
-		return value
-	}
-	return float64(int64(value/lotSize)) * lotSize
+	return utils.RoundToLotSize(value, lotSize)
 }
 
 // ============================================================
