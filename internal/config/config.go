@@ -117,16 +117,98 @@ func Load() (*Config, error) {
 		},
 	}
 
-	// Валидация критичных параметров
-	if cfg.Security.EncryptionKey == "" {
-		return nil, fmt.Errorf("ENCRYPTION_KEY is required for encrypting API keys")
+	// Валидация критичных параметров безопасности
+	if err := cfg.validateSecurity(); err != nil {
+		return nil, err
 	}
 
-	if len(cfg.Security.EncryptionKey) != 32 {
-		return nil, fmt.Errorf("ENCRYPTION_KEY must be exactly 32 bytes for AES-256")
+	// Валидация числовых диапазонов
+	if err := cfg.validateRanges(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil
+}
+
+// validateSecurity проверяет параметры безопасности
+func (c *Config) validateSecurity() error {
+	// ENCRYPTION_KEY обязателен для шифрования API ключей бирж
+	if c.Security.EncryptionKey == "" {
+		return fmt.Errorf("ENCRYPTION_KEY is required for encrypting API keys")
+	}
+
+	if len(c.Security.EncryptionKey) != 32 {
+		return fmt.Errorf("ENCRYPTION_KEY must be exactly 32 bytes for AES-256")
+	}
+
+	// JWT_SECRET обязателен и не должен быть default значением
+	if c.Security.JWTSecret == "" {
+		return fmt.Errorf("JWT_SECRET is required for authentication")
+	}
+
+	if c.Security.JWTSecret == "change-me-in-production" {
+		return fmt.Errorf("JWT_SECRET must be changed from default value in production")
+	}
+
+	if len(c.Security.JWTSecret) < 32 {
+		return fmt.Errorf("JWT_SECRET must be at least 32 characters for security")
+	}
+
+	return nil
+}
+
+// validateRanges проверяет числовые диапазоны параметров
+func (c *Config) validateRanges() error {
+	// Валидация портов
+	if c.Server.Port < 1 || c.Server.Port > 65535 {
+		return fmt.Errorf("SERVER_PORT must be between 1 and 65535, got %d", c.Server.Port)
+	}
+
+	if c.Database.Port < 1 || c.Database.Port > 65535 {
+		return fmt.Errorf("DB_PORT must be between 1 and 65535, got %d", c.Database.Port)
+	}
+
+	// Валидация retry параметров
+	if c.Bot.MaxRetries < 0 {
+		return fmt.Errorf("MAX_RETRIES cannot be negative, got %d", c.Bot.MaxRetries)
+	}
+
+	if c.Bot.MaxRetries > 10 {
+		return fmt.Errorf("MAX_RETRIES should not exceed 10, got %d", c.Bot.MaxRetries)
+	}
+
+	// Валидация таймаутов (должны быть положительными)
+	if c.Bot.OrderTimeout <= 0 {
+		return fmt.Errorf("ORDER_TIMEOUT must be positive, got %v", c.Bot.OrderTimeout)
+	}
+
+	if c.Bot.WSReadTimeout <= 0 {
+		return fmt.Errorf("WS_READ_TIMEOUT must be positive, got %v", c.Bot.WSReadTimeout)
+	}
+
+	// Валидация MaxConcurrentArbs (0 = без лимита, иначе > 0)
+	if c.Bot.MaxConcurrentArbs < 0 {
+		return fmt.Errorf("MAX_CONCURRENT_ARBS cannot be negative, got %d", c.Bot.MaxConcurrentArbs)
+	}
+
+	// Валидация SessionTimeout
+	if c.Security.SessionTimeout < 60 {
+		return fmt.Errorf("SESSION_TIMEOUT must be at least 60 seconds, got %d", c.Security.SessionTimeout)
+	}
+
+	return nil
+}
+
+// DSN возвращает строку подключения к базе данных
+func (d DatabaseConfig) DSN() string {
+	return fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Password, d.Name, d.SSLMode)
+}
+
+// DSNWithoutPassword возвращает строку подключения без пароля (для логирования)
+func (d DatabaseConfig) DSNWithoutPassword() string {
+	return fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=%s",
+		d.Host, d.Port, d.User, d.Name, d.SSLMode)
 }
 
 // Вспомогательные функции для чтения переменных окружения

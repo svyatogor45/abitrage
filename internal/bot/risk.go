@@ -86,11 +86,7 @@ type MarginInfo struct {
 	UpdatedAt        time.Time // Время обновления
 }
 
-// LimitsKey - ключ для кэша лимитов
-type LimitsKey struct {
-	Exchange string
-	Symbol   string
-}
+// LimitsKey определён в order.go - используем его для кэша лимитов
 
 // NewRiskManager создает новый RiskManager
 func NewRiskManager(
