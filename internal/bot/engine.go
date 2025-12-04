@@ -149,6 +149,10 @@ type Engine struct {
 	arbDetector    *ArbitrageDetector
 	arbCoordinator *ArbitrageCoordinator
 
+	// Менеджер рисков (SL/ликвидации) и монитор
+	riskManager *RiskManager
+	riskMonitor *RiskMonitor
+
 	// Менеджер частичного входа
 	partialManager *PartialEntryManager
 
@@ -291,11 +295,11 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &Engine{
-		cfg:              cfg,
-		ctx:              ctx,
-		cancel:           cancel,
-		exchanges:        make(map[string]exchange.Exchange),
-		pairs:            make(map[int]*PairState),
+		cfg:       cfg,
+		ctx:       ctx,
+		cancel:    cancel,
+		exchanges: make(map[string]exchange.Exchange),
+		pairs:     make(map[int]*PairState),
 		// pairsBySymbol: sync.Map инициализируется автоматически (zero value)
 		// positionIndex: sync.Map инициализируется автоматически (zero value)
 		priceTracker:     NewPriceTracker(numShards),
@@ -331,11 +335,23 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	// Инициализация анализатора стаканов (5 уровней, 5 секунд актуальности)
 	e.orderBookAnalyzer = NewOrderBookAnalyzer(5, 5*time.Second)
 
+	balanceFetcher := func(ctx context.Context, exchangeName string) (float64, error) {
+		e.exchMu.RLock()
+		exch, ok := e.exchanges[exchangeName]
+		e.exchMu.RUnlock()
+		if !ok {
+			return 0, fmt.Errorf("exchange %s not found", exchangeName)
+		}
+
+		return exch.GetBalance(ctx)
+	}
+
 	// Инициализация арбитражного детектора
 	e.arbDetector = NewArbitrageDetector(
 		e.priceTracker,
 		e.spreadCalc,
 		e.orderBookAnalyzer,
+		balanceFetcher,
 	)
 
 	// Инициализация координатора арбитража
@@ -363,6 +379,16 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	)
 	e.arbCoordinator.SetFailHandler(e.secondLegFailHandler)
 
+	// Инициализация менеджера рисков: аварийное закрытие SL/ликвидаций
+	e.riskManager = NewRiskManager(
+		e.notificationChan,
+		e.closePositionForRisk,
+		func(pairID int) { _ = e.PausePair(pairID) },
+		DefaultRiskConfig(),
+	)
+	e.riskManager.SetExchanges(e.exchanges)
+	e.riskMonitor = NewRiskMonitor(e.riskManager, e.getHoldingPairsSnapshot)
+
 	return e
 }
 
@@ -379,9 +405,12 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	// Остальные воркеры
 	go e.positionEventLoop(ctx)
-	go e.periodicTasks(ctx)           // балансы, статистика для UI
-	go e.notificationWorker(ctx)      // обработка уведомлений
-	go e.exitConditionChecker(ctx)    // проверка условий выхода
+	go e.periodicTasks(ctx)        // балансы, статистика для UI
+	go e.notificationWorker(ctx)   // обработка уведомлений
+	go e.exitConditionChecker(ctx) // проверка условий выхода
+	if e.riskMonitor != nil {
+		go e.riskMonitor.Start(ctx) // аварийный SL мониторинг
+	}
 
 	<-ctx.Done()
 
@@ -794,6 +823,8 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 			NOrders:       ps.Config.NOrders,
 			LongExchange:  opp.LongExchange,
 			ShortExchange: opp.ShortExchange,
+			EntrySpread:   ps.GetEntrySpread(),
+			ExitSpread:    ps.GetExitSpread(),
 			MinSpread:     ps.GetEntrySpread() * 0.8, // 80% от entry spread (atomic read)
 		})
 
@@ -836,10 +867,16 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 
 		e.notifyTradeOpened(ps, result)
 	} else {
-		// Ошибка - возврат в готовность
-		ps.Runtime.State = models.StateReady
-		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
-		atomic.StoreInt32(&ps.isReady, 1)
+		// Ошибка - возврат в готовность или пауза при провале второй ноги
+		if result.ShouldPause {
+			ps.Runtime.State = models.StatePaused
+			ps.Config.Status = "paused"
+			atomic.StoreInt32(&ps.isReady, 0)
+		} else {
+			ps.Runtime.State = models.StateReady
+			// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
+			atomic.StoreInt32(&ps.isReady, 1)
+		}
 		e.decrementActiveArbs()
 
 		// МЕТРИКА: записываем откат
@@ -880,10 +917,16 @@ func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
 
 		e.notifyTradeOpened(ps, result)
 	} else {
-		// Ошибка - возврат в готовность
-		ps.Runtime.State = models.StateReady
-		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
-		atomic.StoreInt32(&ps.isReady, 1)
+		// Ошибка - возврат в готовность или пауза при провале второй ноги
+		if result.ShouldPause {
+			ps.Runtime.State = models.StatePaused
+			ps.Config.Status = "paused"
+			atomic.StoreInt32(&ps.isReady, 0)
+		} else {
+			ps.Runtime.State = models.StateReady
+			// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
+			atomic.StoreInt32(&ps.isReady, 1)
+		}
 		e.decrementActiveArbs()
 
 		e.notifyError(ps, result.Error)
@@ -921,20 +964,61 @@ func (e *Engine) handleLiquidation(update PositionUpdate) {
 	// МЕТРИКА: записываем ликвидацию
 	LiquidationsDetected.WithLabelValues(update.Exchange, update.Symbol).Inc()
 
-	// Быстрая проверка состояния через atomic
+	if e.riskManager != nil {
+		e.riskManager.OnPositionUpdate(ps, update)
+		return
+	}
+
+	// Fallback для случая отсутствия riskManager
 	ps.mu.Lock()
 	if ps.Runtime.State != models.StateHolding {
 		ps.mu.Unlock()
 		return
 	}
 
-	// Переводим в состояние выхода
 	ps.Runtime.State = models.StateExiting
 	ps.mu.Unlock()
 
-	// КРИТИЧНО: экстренное закрытие второй ноги в отдельной горутине
-	// Используем короткий timeout для минимизации убытков
 	go e.emergencyCloseSecondLeg(ps, update)
+}
+
+// closePositionForRisk - аварийное закрытие обеих ног по сигналу RiskManager
+func (e *Engine) closePositionForRisk(ctx context.Context, ps *PairState, reason ExitReason) error {
+	if ps == nil || ps.Runtime == nil {
+		return fmt.Errorf("pair runtime not initialized")
+	}
+
+	ps.mu.RLock()
+	legsCopy := make([]models.Leg, len(ps.Runtime.Legs))
+	copy(legsCopy, ps.Runtime.Legs)
+	symbol := ps.Config.Symbol
+	ps.mu.RUnlock()
+
+	// Используем укороченный таймаут из контекста RiskManager
+	result := e.orderExec.CloseParallel(ctx, CloseParams{
+		Symbol: symbol,
+		Legs:   legsCopy,
+	})
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	if !result.Success {
+		ps.Runtime.State = models.StateError
+		return result.Error
+	}
+
+	e.removeFromPositionIndex(ps)
+	ps.Runtime.Legs = nil
+	ps.Runtime.FilledParts = 0
+	e.decrementActiveArbs()
+
+	ps.Runtime.State = models.StatePaused
+	ps.Config.Status = "paused"
+	atomic.StoreInt32(&ps.isReady, 0)
+
+	e.notifyTradeClosed(ps, result, reason)
+	return nil
 }
 
 // emergencyCloseSecondLeg экстренно закрывает вторую ногу при ликвидации
@@ -1288,13 +1372,13 @@ func (e *Engine) notifyTradeOpened(ps *PairState, result *ExecuteResult) {
 			longLeg.Exchange, longLeg.EntryPrice,
 			shortLeg.Exchange, shortLeg.EntryPrice),
 		Meta: map[string]interface{}{
-			"symbol":          ps.Config.Symbol,
-			"long_exchange":   longLeg.Exchange,
-			"long_price":      longLeg.EntryPrice,
-			"long_qty":        longLeg.Quantity,
-			"short_exchange":  shortLeg.Exchange,
-			"short_price":     shortLeg.EntryPrice,
-			"short_qty":       shortLeg.Quantity,
+			"symbol":         ps.Config.Symbol,
+			"long_exchange":  longLeg.Exchange,
+			"long_price":     longLeg.EntryPrice,
+			"long_qty":       longLeg.Quantity,
+			"short_exchange": shortLeg.Exchange,
+			"short_price":    shortLeg.EntryPrice,
+			"short_qty":      shortLeg.Quantity,
 		},
 	}
 
@@ -1337,6 +1421,10 @@ func (e *Engine) AddExchange(name string, exch exchange.Exchange) {
 	e.exchanges[name] = exch
 	e.exchMu.Unlock()
 
+	if e.riskManager != nil {
+		e.riskManager.AddExchange(name, exch)
+	}
+
 	// Подписка на WebSocket обновления
 	e.subscribeToExchange(name, exch)
 }
@@ -1353,6 +1441,22 @@ func (e *Engine) subscribeToExchange(name string, exch exchange.Exchange) {
 			UnrealizedPnl: pos.UnrealizedPnl,
 		}
 	})
+}
+
+// getHoldingPairsSnapshot возвращает snapshot пар в HOLDING для RiskMonitor
+func (e *Engine) getHoldingPairsSnapshot() []*PairState {
+	e.pairsMu.RLock()
+	pairsCopy := make([]*PairState, 0, len(e.pairs))
+	for _, ps := range e.pairs {
+		ps.mu.RLock()
+		isHolding := ps.Runtime != nil && ps.Runtime.State == models.StateHolding
+		if isHolding {
+			pairsCopy = append(pairsCopy, ps)
+		}
+		ps.mu.RUnlock()
+	}
+	e.pairsMu.RUnlock()
+	return pairsCopy
 }
 
 // AddPair добавляет торговую пару
