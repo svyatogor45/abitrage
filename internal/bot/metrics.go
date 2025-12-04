@@ -161,6 +161,17 @@ var BufferOverflows = promauto.NewCounterVec(
 	[]string{"buffer"}, // price_shard, notification, position
 )
 
+// BufferBacklogRatio - заполненность буферов (0..1)
+var BufferBacklogRatio = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "arbitrage",
+		Subsystem: "trading",
+		Name:      "buffer_backlog_ratio",
+		Help:      "Channel backlog ratio (len/cap) per buffer",
+	},
+	[]string{"buffer"}, // price_shard, notification, position
+)
+
 // GoroutineCount - количество горутин
 var GoroutineCount = promauto.NewGauge(
 	prometheus.GaugeOpts{
@@ -229,6 +240,39 @@ var LiquidationsDetected = promauto.NewCounterVec(
 	[]string{"exchange", "symbol"},
 )
 
+// StateTransitions - количество переходов между состояниями
+var StateTransitions = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "arbitrage",
+		Subsystem: "fsm",
+		Name:      "state_transitions_total",
+		Help:      "Number of state transitions by from/to state",
+	},
+	[]string{"from", "to", "forced"},
+)
+
+// RecoveryPositions - сводка восстановленных/потерянных позиций
+var RecoveryPositions = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "arbitrage",
+		Subsystem: "recovery",
+		Name:      "positions",
+		Help:      "Counts of matched, orphaned and closed orphaned positions during recovery",
+	},
+	[]string{"status"}, // matched, orphaned, closed_orphaned
+)
+
+// RecoveryRuns - общее количество запусков восстановления
+var RecoveryRuns = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "arbitrage",
+		Subsystem: "recovery",
+		Name:      "runs_total",
+		Help:      "Recovery runs grouped by result",
+	},
+	[]string{"result"}, // success, partial, failed
+)
+
 // ============ Вспомогательные функции ============
 
 // RecordPriceUpdateLatency записывает латентность обработки цены
@@ -253,6 +297,15 @@ func RecordTrade(symbol, result string, pnl float64) {
 // RecordBufferOverflow записывает переполнение буфера
 func RecordBufferOverflow(bufferName string) {
 	BufferOverflows.WithLabelValues(bufferName).Inc()
+}
+
+// RecordBufferBacklog записывает заполненность буфера (0..1)
+func RecordBufferBacklog(bufferName string, capacity, depth int) {
+	if capacity == 0 {
+		return
+	}
+
+	BufferBacklogRatio.WithLabelValues(bufferName).Set(float64(depth) / float64(capacity))
 }
 
 // UpdateActiveArbitrages обновляет счётчик активных арбитражей
@@ -282,4 +335,21 @@ func RecordOpportunity(symbol string, triggered bool) {
 // RecordSpread записывает наблюдаемый спред
 func RecordSpread(symbol string, spreadPercent float64) {
 	SpreadObserved.WithLabelValues(symbol).Observe(spreadPercent)
+}
+
+// RecordRecoverySummary фиксирует итоги восстановления
+func RecordRecoverySummary(matched, orphaned, closedOrphaned, errors int) {
+	RecoveryPositions.WithLabelValues("matched").Set(float64(matched))
+	RecoveryPositions.WithLabelValues("orphaned").Set(float64(orphaned))
+	RecoveryPositions.WithLabelValues("closed_orphaned").Set(float64(closedOrphaned))
+
+	result := "success"
+	switch {
+	case errors > 0:
+		result = "failed"
+	case orphaned > 0:
+		result = "partial"
+	}
+
+	RecoveryRuns.WithLabelValues(result).Inc()
 }

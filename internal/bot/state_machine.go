@@ -2,8 +2,11 @@ package bot
 
 import (
 	"arbitrage/internal/models"
+	"arbitrage/pkg/utils"
 	"fmt"
 	"sync"
+
+	"go.uber.org/zap"
 )
 
 // validTransitions определяет допустимые переходы между состояниями
@@ -11,7 +14,7 @@ import (
 var validTransitions = map[string][]string{
 	models.StatePaused:   {models.StateReady},
 	models.StateReady:    {models.StatePaused, models.StateEntering},
-	models.StateEntering: {models.StateHolding, models.StateReady, models.StateError}, // Ready при откате
+	models.StateEntering: {models.StateHolding, models.StateReady, models.StateError},  // Ready при откате
 	models.StateHolding:  {models.StateExiting, models.StatePaused, models.StateError}, // PAUSED при SL/ликвидации
 	models.StateExiting:  {models.StateReady, models.StatePaused, models.StateError},
 	models.StateError:    {models.StatePaused}, // Только ручной сброс
@@ -75,8 +78,8 @@ func TryTransition(runtime *models.PairRuntime, pairID int, newState string) err
 		}
 	}
 	runtime.State = newState
-	// Записываем метрику перехода (async-safe, использует свой lock)
-	RecordTransition(oldState, newState)
+	// Записываем метрику перехода и логируем смену состояния
+	logTransition(pairID, oldState, newState, false)
 	return nil
 }
 
@@ -85,6 +88,15 @@ func TryTransition(runtime *models.PairRuntime, pairID int, newState string) err
 // ВАЖНО: вызывающий код должен держать lock на PairState.mu
 func ForceTransition(runtime *models.PairRuntime, newState string) {
 	runtime.State = newState
+}
+
+// ForceTransitionWithLog устанавливает состояние без проверки и логирует переход
+// Используется для аварийных ситуаций (ликвидации, критические ошибки)
+// ВАЖНО: вызывающий код должен держать lock на PairState.mu
+func ForceTransitionWithLog(runtime *models.PairRuntime, pairID int, newState string) {
+	oldState := runtime.State
+	runtime.State = newState
+	logTransition(pairID, oldState, newState, true)
 }
 
 // TransitionCounter отслеживает все переходы для метрик
@@ -96,10 +108,7 @@ var (
 // RecordTransition записывает переход для метрик
 // Вызывается автоматически в TryTransition, можно вызвать вручную для ForceTransition
 func RecordTransition(from, to string) {
-	key := from + "→" + to
-	transitionCounterLock.Lock()
-	transitionCounter[key]++
-	transitionCounterLock.Unlock()
+	recordTransitionCounts(from, to, false)
 }
 
 // GetTransitionStats возвращает статистику переходов (для отладки)
@@ -149,4 +158,32 @@ func HasOpenPosition(s string) bool {
 // Не включает ENTERING - только HOLDING (позиция открыта) и EXITING (закрывается)
 func HasFilledPosition(s string) bool {
 	return s == models.StateHolding || s == models.StateExiting
+}
+
+// logTransition записывает метрики/логи переходов централизованно
+func logTransition(pairID int, from, to string, forced bool) {
+	recordTransitionCounts(from, to, forced)
+
+	if logger := utils.GetGlobalLogger(); logger != nil {
+		logger.WithComponent("state_machine").With(
+			zap.Int("pair_id", pairID),
+			zap.String("from_state", from),
+			zap.String("to_state", to),
+			zap.Bool("forced", forced),
+		).Info("state transition")
+	}
+}
+
+// recordTransitionCounts инкрементирует локальные и Prometheus метрики
+func recordTransitionCounts(from, to string, forced bool) {
+	key := from + "→" + to
+	transitionCounterLock.Lock()
+	transitionCounter[key]++
+	transitionCounterLock.Unlock()
+
+	forcedLabel := "no"
+	if forced {
+		forcedLabel = "yes"
+	}
+	StateTransitions.WithLabelValues(from, to, forcedLabel).Inc()
 }
