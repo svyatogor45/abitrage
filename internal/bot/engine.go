@@ -850,10 +850,16 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 
 		e.notifyTradeOpened(ps, result)
 	} else {
-		// Ошибка - возврат в готовность
-		ps.Runtime.State = models.StateReady
-		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
-		atomic.StoreInt32(&ps.isReady, 1)
+		// Ошибка - возврат в готовность или пауза при провале второй ноги
+		if result.ShouldPause {
+			ps.Runtime.State = models.StatePaused
+			ps.Config.Status = "paused"
+			atomic.StoreInt32(&ps.isReady, 0)
+		} else {
+			ps.Runtime.State = models.StateReady
+			// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
+			atomic.StoreInt32(&ps.isReady, 1)
+		}
 		e.decrementActiveArbs()
 
 		// МЕТРИКА: записываем откат
@@ -894,10 +900,16 @@ func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
 
 		e.notifyTradeOpened(ps, result)
 	} else {
-		// Ошибка - возврат в готовность
-		ps.Runtime.State = models.StateReady
-		// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
-		atomic.StoreInt32(&ps.isReady, 1)
+		// Ошибка - возврат в готовность или пауза при провале второй ноги
+		if result.ShouldPause {
+			ps.Runtime.State = models.StatePaused
+			ps.Config.Status = "paused"
+			atomic.StoreInt32(&ps.isReady, 0)
+		} else {
+			ps.Runtime.State = models.StateReady
+			// ОПТИМИЗАЦИЯ: восстанавливаем atomic флаг для быстрой проверки
+			atomic.StoreInt32(&ps.isReady, 1)
+		}
 		e.decrementActiveArbs()
 
 		e.notifyError(ps, result.Error)
