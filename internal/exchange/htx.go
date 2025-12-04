@@ -551,13 +551,30 @@ func (h *HTX) handleMessage(message []byte) {
 	}
 }
 
+// SubscribePositions сохраняет callback для обновлений позиций.
+//
+// ВАЖНО: HTX (Huobi) требует отдельного аутентифицированного WebSocket соединения
+// для приватных каналов (позиции, ордера). Текущая реализация использует упрощённый
+// подход - callback сохраняется, но WebSocket подписка не создаётся.
+//
+// Обнаружение ликвидаций реализуется через:
+// 1. Периодический polling через GetOpenPositions() в Risk Manager (каждые 500ms)
+// 2. Сравнение markPrice с liquidationPrice для раннего предупреждения
+//
+// Для полной реализации потребуется:
+// - Отдельный WebSocket к wss://api.hbdm.com/linear-swap-notification
+// - Аутентификация через HMAC-SHA256 с timestamp
+// - Подписка на канал "positions" с contract_code
+//
+// См. документацию HTX: https://www.htx.com/en-us/opend/newApiPages/?id=8cb7e898-77b5-11ed-9966-0242ac110003
 func (h *HTX) SubscribePositions(callback func(*Position)) error {
 	h.callbackMu.Lock()
 	h.positionCallback = callback
 	h.callbackMu.Unlock()
 
-	// HTX требует отдельного WebSocket для приватных подписок
-	// Для упрощения используем polling через REST API
+	// Callback сохранён для использования при polling через REST API
+	// или для будущей реализации WebSocket подписки
+	log.Printf("[htx] SubscribePositions: callback registered (using REST API polling for position updates)")
 	return nil
 }
 

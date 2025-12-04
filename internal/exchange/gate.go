@@ -449,43 +449,119 @@ func (g *Gate) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 
 // handleMessage обрабатывает одно сообщение из WebSocket
 func (g *Gate) handleMessage(message []byte) {
-	var msg struct {
-		Channel string `json:"channel"`
-		Event   string `json:"event"`
-		Result  []struct {
-			Contract   string `json:"contract"`
-			Last       string `json:"last"`
-			LowestAsk  string `json:"lowest_ask"`
-			HighestBid string `json:"highest_bid"`
-		} `json:"result"`
+	// Сначала определяем тип канала
+	var baseMsg struct {
+		Channel string          `json:"channel"`
+		Event   string          `json:"event"`
+		Result  json.RawMessage `json:"result"`
 	}
 
-	if err := json.Unmarshal(message, &msg); err != nil {
+	if err := json.Unmarshal(message, &baseMsg); err != nil {
 		return
 	}
 
-	if msg.Channel == "futures.tickers" && msg.Event == "update" {
-		for _, t := range msg.Result {
-			symbol := g.fromGateSymbol(t.Contract)
-
-			g.callbackMu.RLock()
-			callback, ok := g.tickerCallbacks[symbol]
-			g.callbackMu.RUnlock()
-
-			if ok && callback != nil {
-				bidPrice := g.parseFloat(t.HighestBid, "ws.ticker.highestBid")
-				askPrice := g.parseFloat(t.LowestAsk, "ws.ticker.lowestAsk")
-				lastPrice := g.parseFloat(t.Last, "ws.ticker.last")
-
-				callback(&Ticker{
-					Symbol:    symbol,
-					BidPrice:  bidPrice,
-					AskPrice:  askPrice,
-					LastPrice: lastPrice,
-					Timestamp: time.Now(),
-				})
-			}
+	switch baseMsg.Channel {
+	case "futures.tickers":
+		if baseMsg.Event == "update" {
+			g.handleTickerUpdate(baseMsg.Result)
 		}
+	case "futures.positions":
+		if baseMsg.Event == "update" {
+			g.handlePositionUpdate(baseMsg.Result)
+		}
+	}
+}
+
+// handleTickerUpdate обрабатывает обновления тикеров
+func (g *Gate) handleTickerUpdate(data json.RawMessage) {
+	var tickers []struct {
+		Contract   string `json:"contract"`
+		Last       string `json:"last"`
+		LowestAsk  string `json:"lowest_ask"`
+		HighestBid string `json:"highest_bid"`
+	}
+
+	if err := json.Unmarshal(data, &tickers); err != nil {
+		return
+	}
+
+	for _, t := range tickers {
+		symbol := g.fromGateSymbol(t.Contract)
+
+		g.callbackMu.RLock()
+		callback, ok := g.tickerCallbacks[symbol]
+		g.callbackMu.RUnlock()
+
+		if ok && callback != nil {
+			bidPrice := g.parseFloat(t.HighestBid, "ws.ticker.highestBid")
+			askPrice := g.parseFloat(t.LowestAsk, "ws.ticker.lowestAsk")
+			lastPrice := g.parseFloat(t.Last, "ws.ticker.last")
+
+			callback(&Ticker{
+				Symbol:    symbol,
+				BidPrice:  bidPrice,
+				AskPrice:  askPrice,
+				LastPrice: lastPrice,
+				Timestamp: time.Now(),
+			})
+		}
+	}
+}
+
+// handlePositionUpdate обрабатывает обновления позиций (для обнаружения ликвидаций)
+func (g *Gate) handlePositionUpdate(data json.RawMessage) {
+	var positions []struct {
+		Contract      string `json:"contract"`
+		Size          int64  `json:"size"`
+		EntryPrice    string `json:"entry_price"`
+		MarkPrice     string `json:"mark_price"`
+		Leverage      int    `json:"leverage"`
+		UnrealisedPnl string `json:"unrealised_pnl"`
+		LiqPrice      string `json:"liq_price"`
+		Mode          string `json:"mode"`
+		UpdateTime    int64  `json:"update_time"`
+	}
+
+	if err := json.Unmarshal(data, &positions); err != nil {
+		log.Printf("[gate] failed to parse position update: %v", err)
+		return
+	}
+
+	g.callbackMu.RLock()
+	callback := g.positionCallback
+	g.callbackMu.RUnlock()
+
+	if callback == nil {
+		return
+	}
+
+	for _, p := range positions {
+		side := SideLong
+		size := float64(p.Size)
+		if p.Size < 0 {
+			side = SideShort
+			size = -size
+		}
+
+		// Проверяем ликвидацию: если размер стал 0 и была позиция
+		liquidation := false
+		if p.Size == 0 {
+			// Позиция закрыта - возможно ликвидация
+			// Gate.io не присылает явный флаг ликвидации, определяем по контексту
+			liquidation = false // будет определяться через markPrice vs liqPrice в Risk Manager
+		}
+
+		callback(&Position{
+			Symbol:        g.fromGateSymbol(p.Contract),
+			Side:          side,
+			Size:          size,
+			EntryPrice:    g.parseFloat(p.EntryPrice, "ws.position.entryPrice"),
+			MarkPrice:     g.parseFloat(p.MarkPrice, "ws.position.markPrice"),
+			Leverage:      p.Leverage,
+			UnrealizedPnl: g.parseFloat(p.UnrealisedPnl, "ws.position.unrealisedPnl"),
+			Liquidation:   liquidation,
+			UpdatedAt:     time.Unix(p.UpdateTime, 0),
+		})
 	}
 }
 

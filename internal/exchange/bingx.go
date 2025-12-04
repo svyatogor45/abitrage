@@ -493,12 +493,30 @@ func (b *BingX) handleMessage(message []byte) {
 	}
 }
 
+// SubscribePositions сохраняет callback для обновлений позиций.
+//
+// ВАЖНО: BingX требует отдельного аутентифицированного WebSocket соединения
+// для приватных каналов. Текущая реализация использует упрощённый подход -
+// callback сохраняется, но WebSocket подписка не создаётся.
+//
+// Обнаружение ликвидаций реализуется через:
+// 1. Периодический polling через GetOpenPositions() в Risk Manager (каждые 500ms)
+// 2. Сравнение markPrice с liquidationPrice для раннего предупреждения
+//
+// Для полной реализации потребуется:
+// - WebSocket к wss://open-api-swap.bingx.com/swap-market с аутентификацией
+// - Подписка на канал ACCOUNT_UPDATE для отслеживания позиций
+// - Обработка сообщений типа "ACCOUNT_UPDATE" с eventType "LIQUIDATION"
+//
+// См. документацию BingX: https://bingx-api.github.io/docs/#/en-us/swapV2/socket/account.html
 func (b *BingX) SubscribePositions(callback func(*Position)) error {
 	b.callbackMu.Lock()
 	b.positionCallback = callback
 	b.callbackMu.Unlock()
 
-	// BingX требует отдельного WebSocket для приватных подписок
+	// Callback сохранён для использования при polling через REST API
+	// или для будущей реализации WebSocket подписки
+	log.Printf("[bingx] SubscribePositions: callback registered (using REST API polling for position updates)")
 	return nil
 }
 
