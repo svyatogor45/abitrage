@@ -211,8 +211,14 @@ func (oe *OrderExecutor) handleResults(
 	longRes, shortRes LegResult,
 ) *ExecuteResult {
 
-	// Оба успешны
+	// Оба успешны - проверяем что Order != nil (защита от edge case биржевого API)
 	if longRes.Error == nil && shortRes.Error == nil {
+		if longRes.Order == nil || shortRes.Order == nil {
+			return &ExecuteResult{
+				Success: false,
+				Error:   fmt.Errorf("unexpected nil order: long=%v, short=%v", longRes.Order, shortRes.Order),
+			}
+		}
 		return &ExecuteResult{
 			Success:    true,
 			LongOrder:  longRes.Order,
