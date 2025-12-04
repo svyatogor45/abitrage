@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 	"arbitrage/internal/config"
 	"arbitrage/internal/exchange"
 	"arbitrage/internal/models"
+	"arbitrage/pkg/utils"
 )
 
 // ============ ОПТИМИЗАЦИЯ: Object Pools для zero-allocation ============
@@ -187,6 +189,43 @@ type PairState struct {
 	// 1 = active и ready для торговли, 0 = неактивна
 	// Позволяет быстро отсеять неактивные пары без захвата mutex
 	isReady int32
+
+	// ОПТИМИЗАЦИЯ: atomic копии торговых параметров для lock-free чтения в горячем пути
+	// Используем atomic.Uint64 + math.Float64bits/Float64frombits для float64
+	// Обновляются при UpdatePairConfig, читаются в checkArbitrageOpportunity
+	entrySpreadBits uint64 // atomic: EntrySpreadPct в битовом представлении
+	exitSpreadBits  uint64 // atomic: ExitSpreadPct в битовом представлении
+	stopLossBits    uint64 // atomic: StopLoss в битовом представлении
+}
+
+// GetEntrySpread возвращает EntrySpreadPct атомарно (lock-free)
+func (ps *PairState) GetEntrySpread() float64 {
+	return math.Float64frombits(atomic.LoadUint64(&ps.entrySpreadBits))
+}
+
+// GetExitSpread возвращает ExitSpreadPct атомарно (lock-free)
+func (ps *PairState) GetExitSpread() float64 {
+	return math.Float64frombits(atomic.LoadUint64(&ps.exitSpreadBits))
+}
+
+// GetStopLoss возвращает StopLoss атомарно (lock-free)
+func (ps *PairState) GetStopLoss() float64 {
+	return math.Float64frombits(atomic.LoadUint64(&ps.stopLossBits))
+}
+
+// setEntrySpread устанавливает EntrySpreadPct атомарно
+func (ps *PairState) setEntrySpread(v float64) {
+	atomic.StoreUint64(&ps.entrySpreadBits, math.Float64bits(v))
+}
+
+// setExitSpread устанавливает ExitSpreadPct атомарно
+func (ps *PairState) setExitSpread(v float64) {
+	atomic.StoreUint64(&ps.exitSpreadBits, math.Float64bits(v))
+}
+
+// setStopLoss устанавливает StopLoss атомарно
+func (ps *PairState) setStopLoss(v float64) {
+	atomic.StoreUint64(&ps.stopLossBits, math.Float64bits(v))
 }
 
 // PriceUpdate - событие обновления цены от WebSocket
@@ -652,9 +691,10 @@ func (e *Engine) checkArbitrageOpportunity(ps *PairState) {
 	}
 
 	// ОПТИМИЗАЦИЯ 3: быстрая проверка спреда БЕЗ Lock
-	// Config.Symbol и Config.EntrySpreadPct - immutable, безопасно читать
+	// Config.Symbol - immutable (не меняется после создания пары)
+	// EntrySpread - читаем атомарно через GetEntrySpread() (lock-free)
 	symbol := ps.Config.Symbol
-	entrySpread := ps.Config.EntrySpreadPct
+	entrySpread := ps.GetEntrySpread()
 
 	// Получаем текущую арбитражную возможность (lock-free через sync.Map)
 	opp := e.arbDetector.DetectOpportunity(symbol)
@@ -727,7 +767,8 @@ func (e *Engine) shouldEnter(ps *PairState, opp *ArbitrageOpportunity) bool {
 
 // executeEntryWithConditions - исполнение входа с предварительно проверенными условиями
 func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryConditions) {
-	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
+	// Используем родительский контекст e.ctx для корректного graceful shutdown
+	ctx, cancel := context.WithTimeout(e.ctx, e.cfg.Bot.OrderTimeout)
 	defer cancel()
 
 	// ОПТИМИЗАЦИЯ: освобождаем объекты в конце (возвращаем в пул)
@@ -753,7 +794,7 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 			NOrders:       ps.Config.NOrders,
 			LongExchange:  opp.LongExchange,
 			ShortExchange: opp.ShortExchange,
-			MinSpread:     ps.Config.EntrySpreadPct * 0.8, // 80% от entry spread
+			MinSpread:     ps.GetEntrySpread() * 0.8, // 80% от entry spread (atomic read)
 		})
 
 		result = &ExecuteResult{
@@ -809,9 +850,10 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 }
 
 // executeEntry - исполнение входа в арбитраж (ПАРАЛЛЕЛЬНЫЕ ОРДЕРА!)
-// Legacy метод, используйте executeEntryWithConditions
+// Deprecated: используйте executeEntryWithConditions
 func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
-	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
+	// Используем родительский контекст e.ctx для корректного graceful shutdown
+	ctx, cancel := context.WithTimeout(e.ctx, e.cfg.Bot.OrderTimeout)
 	defer cancel()
 
 	// Параллельная отправка ордеров на обе биржи
@@ -1324,6 +1366,11 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 		},
 	}
 
+	// ОПТИМИЗАЦИЯ: инициализируем atomic поля для lock-free чтения в горячем пути
+	ps.setEntrySpread(cfg.EntrySpreadPct)
+	ps.setExitSpread(cfg.ExitSpreadPct)
+	ps.setStopLoss(cfg.StopLoss)
+
 	// Добавляем в основной map под lock
 	e.pairsMu.Lock()
 	e.pairs[cfg.ID] = ps
@@ -1332,6 +1379,7 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map с защитой от бесконечного цикла
 	// Используем Load → modify → Store паттерн
 	const maxCASRetries = 100
+	casSuccess := false
 	for i := 0; i < maxCASRetries; i++ {
 		existing, _ := e.pairsBySymbol.Load(cfg.Symbol)
 		var newSlice []*PairState
@@ -1346,12 +1394,21 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 		// Атомарная замена (если значение изменилось, повторяем)
 		if existing == nil {
 			if _, loaded := e.pairsBySymbol.LoadOrStore(cfg.Symbol, newSlice); !loaded {
+				casSuccess = true
 				break
 			}
 		} else {
 			if e.pairsBySymbol.CompareAndSwap(cfg.Symbol, existing, newSlice) {
+				casSuccess = true
 				break
 			}
+		}
+	}
+
+	// Логируем если CAS не удался (крайне маловероятно, но важно для отладки)
+	if !casSuccess {
+		if logger := utils.GetGlobalLogger(); logger != nil {
+			logger.Sugar().Warnf("AddPair: CAS retry exhausted for symbol %s after %d attempts", cfg.Symbol, maxCASRetries)
 		}
 	}
 
@@ -1373,11 +1430,12 @@ func (e *Engine) RemovePair(pairID int) {
 	delete(e.pairs, pairID)
 	e.pairsMu.Unlock()
 
-	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map
-	for {
+	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map с ограничением итераций
+	const maxCASRetries = 100
+	for i := 0; i < maxCASRetries; i++ {
 		existing, ok := e.pairsBySymbol.Load(symbol)
 		if !ok {
-			break // Уже удалено
+			return // Уже удалено
 		}
 
 		oldSlice := existing.([]*PairState)
@@ -1393,13 +1451,18 @@ func (e *Engine) RemovePair(pairID int) {
 		// Если слайс пустой - удаляем ключ
 		if len(newSlice) == 0 {
 			if e.pairsBySymbol.CompareAndDelete(symbol, existing) {
-				break
+				return
 			}
 		} else {
 			if e.pairsBySymbol.CompareAndSwap(symbol, existing, newSlice) {
-				break
+				return
 			}
 		}
+	}
+
+	// Логируем если CAS не удался (крайне маловероятно)
+	if logger := utils.GetGlobalLogger(); logger != nil {
+		logger.Sugar().Warnf("RemovePair: CAS retry exhausted for symbol %s after %d attempts", symbol, maxCASRetries)
 	}
 }
 
@@ -1574,12 +1637,18 @@ func (e *Engine) UpdatePairConfig(pairID int, cfg *models.PairConfig) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	// Обновляем торговые параметры
+	// Обновляем торговые параметры в Config (для персистентности)
 	ps.Config.EntrySpreadPct = cfg.EntrySpreadPct
 	ps.Config.ExitSpreadPct = cfg.ExitSpreadPct
 	ps.Config.VolumeAsset = cfg.VolumeAsset
 	ps.Config.NOrders = cfg.NOrders
 	ps.Config.StopLoss = cfg.StopLoss
+
+	// ОПТИМИЗАЦИЯ: обновляем atomic копии для lock-free чтения в горячем пути
+	// Эти значения читаются в checkArbitrageOpportunity без блокировки
+	ps.setEntrySpread(cfg.EntrySpreadPct)
+	ps.setExitSpread(cfg.ExitSpreadPct)
+	ps.setStopLoss(cfg.StopLoss)
 }
 
 // HasOpenPosition проверяет, есть ли открытая позиция у пары
