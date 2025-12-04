@@ -41,7 +41,7 @@ type RecoveryManager struct {
 	engine *Engine
 
 	// Настройки восстановления
-	autoCloseOrphaned bool  // Автоматически закрывать "потерянные" позиции
+	autoCloseOrphaned bool // Автоматически закрывать "потерянные" позиции
 	recoveryTimeout   time.Duration
 }
 
@@ -121,7 +121,7 @@ type RecoveryResult struct {
 type DiscoveredPosition struct {
 	Exchange      string
 	Symbol        string
-	Side          string  // "long" или "short"
+	Side          string // "long" или "short"
 	Size          float64
 	EntryPrice    float64
 	UnrealizedPnl float64
@@ -129,12 +129,12 @@ type DiscoveredPosition struct {
 
 // MatchedPosition представляет позицию, связанную с парой бота
 type MatchedPosition struct {
-	PairID       int
-	PairSymbol   string
-	LongLeg      *DiscoveredPosition
-	ShortLeg     *DiscoveredPosition
-	TotalPnl     float64
-	IsComplete   bool // обе ноги найдены
+	PairID     int
+	PairSymbol string
+	LongLeg    *DiscoveredPosition
+	ShortLeg   *DiscoveredPosition
+	TotalPnl   float64
+	IsComplete bool // обе ноги найдены
 }
 
 // Recover выполняет полный процесс восстановления
@@ -215,6 +215,13 @@ func (rm *RecoveryManager) Recover(ctx context.Context) (*RecoveryResult, error)
 
 	// Шаг 8: Активация мониторинга (с учётом восстановленных состояний)
 	result.PairsActivated = rm.activateMonitoring(pairs)
+
+	RecordRecoverySummary(
+		len(result.MatchedPositions),
+		len(result.OrphanedPositions),
+		result.ClosedOrphaned,
+		len(result.Errors),
+	)
 
 	return result, nil
 }
@@ -435,9 +442,7 @@ func (rm *RecoveryManager) restoreRuntimeState(matched []*MatchedPosition) {
 
 			if ok {
 				ps.mu.Lock()
-				oldState := ps.Runtime.State
-				ForceTransition(ps.Runtime, models.StateError)
-				RecordTransition(oldState, models.StateError)
+				ForceTransitionWithLog(ps.Runtime, ps.Config.ID, models.StateError)
 				ps.Config.Status = models.PairStatusPaused
 				ps.mu.Unlock()
 			}
@@ -481,8 +486,7 @@ func (rm *RecoveryManager) restoreRuntimeState(matched []*MatchedPosition) {
 		}
 
 		oldState := ps.Runtime.State
-		ForceTransition(ps.Runtime, models.StateHolding)
-		RecordTransition(oldState, models.StateHolding)
+		ForceTransitionWithLog(ps.Runtime, ps.Config.ID, models.StateHolding)
 		ps.Runtime.Legs = legs
 		ps.Runtime.UnrealizedPnl = mp.TotalPnl
 		ps.Runtime.LastUpdate = time.Now()
@@ -659,13 +663,13 @@ func (rm *RecoveryManager) RecoverAsync(ctx context.Context) <-chan *RecoveryRes
 
 // GetRecoveryStatus возвращает текущий статус восстановления (для API)
 type RecoveryStatus struct {
-	InProgress         bool                `json:"in_progress"`
-	LastRecoveryTime   *time.Time          `json:"last_recovery_time,omitempty"`
-	ExchangesConnected int                 `json:"exchanges_connected"`
-	PairsLoaded        int                 `json:"pairs_loaded"`
-	OpenPositions      int                 `json:"open_positions"`
-	OrphanedPositions  int                 `json:"orphaned_positions"`
-	Errors             []string            `json:"errors,omitempty"`
+	InProgress         bool       `json:"in_progress"`
+	LastRecoveryTime   *time.Time `json:"last_recovery_time,omitempty"`
+	ExchangesConnected int        `json:"exchanges_connected"`
+	PairsLoaded        int        `json:"pairs_loaded"`
+	OpenPositions      int        `json:"open_positions"`
+	OrphanedPositions  int        `json:"orphaned_positions"`
+	Errors             []string   `json:"errors,omitempty"`
 }
 
 // VerifyPositions проверяет соответствие позиций в engine с позициями на биржах
