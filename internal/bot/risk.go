@@ -220,9 +220,7 @@ func (rm *RiskManager) HandleLiquidation(ctx context.Context, ps *PairState, eve
 	}
 
 	// Переводим в состояние EXITING через state machine
-	oldState := ps.Runtime.State
-	ForceTransition(ps.Runtime, models.StateExiting)
-	RecordTransition(oldState, models.StateExiting)
+	ForceTransitionWithLog(ps.Runtime, ps.Config.ID, models.StateExiting)
 	ps.mu.Unlock()
 
 	// Экстренное закрытие оставшейся ноги с retry
@@ -231,9 +229,7 @@ func (rm *RiskManager) HandleLiquidation(ctx context.Context, ps *PairState, eve
 	ps.mu.Lock()
 	if closeErr != nil {
 		// Ошибка закрытия - переводим в ERROR через state machine
-		oldState := ps.Runtime.State
-		ForceTransition(ps.Runtime, models.StateError)
-		RecordTransition(oldState, models.StateError)
+		ForceTransitionWithLog(ps.Runtime, ps.Config.ID, models.StateError)
 		ps.mu.Unlock()
 		rm.notifyError(ps, fmt.Errorf("emergency close failed after liquidation: %w", closeErr))
 		return closeErr
@@ -241,9 +237,7 @@ func (rm *RiskManager) HandleLiquidation(ctx context.Context, ps *PairState, eve
 
 	// Очищаем позицию и ставим на паузу через state machine
 	ps.Runtime.Legs = nil
-	oldState = ps.Runtime.State
-	ForceTransition(ps.Runtime, models.StatePaused)
-	RecordTransition(oldState, models.StatePaused)
+	ForceTransitionWithLog(ps.Runtime, ps.Config.ID, models.StatePaused)
 	ps.Config.Status = "paused"
 	ps.mu.Unlock()
 
@@ -313,11 +307,11 @@ func (rm *RiskManager) OnPositionUpdate(ps *PairState, update PositionUpdate) {
 
 // MarginCheck - результат проверки маржи
 type MarginCheck struct {
-	Sufficient       bool    // Достаточно ли маржи
-	RequiredMargin   float64 // Необходимая маржа
-	AvailableMargin  float64 // Доступная маржа
-	Deficit          float64 // Дефицит (если недостаточно)
-	Exchange         string  // Биржа
+	Sufficient      bool    // Достаточно ли маржи
+	RequiredMargin  float64 // Необходимая маржа
+	AvailableMargin float64 // Доступная маржа
+	Deficit         float64 // Дефицит (если недостаточно)
+	Exchange        string  // Биржа
 }
 
 // CheckMarginRequirement проверяет достаточность маржи для открытия позиции
@@ -606,10 +600,10 @@ func (rm *RiskManager) notifyError(ps *PairState, err error) {
 
 // RiskMonitor - воркер для периодической проверки рисков
 type RiskMonitor struct {
-	rm          *RiskManager
-	getPairs    func() []*PairState
-	stopCh      chan struct{}
-	interval    time.Duration
+	rm       *RiskManager
+	getPairs func() []*PairState
+	stopCh   chan struct{}
+	interval time.Duration
 }
 
 // NewRiskMonitor создает монитор рисков
