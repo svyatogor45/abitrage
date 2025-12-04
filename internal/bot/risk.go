@@ -219,8 +219,10 @@ func (rm *RiskManager) HandleLiquidation(ctx context.Context, ps *PairState, eve
 		return fmt.Errorf("could not identify legs for liquidation event")
 	}
 
-	// Переводим в состояние EXITING
-	ps.Runtime.State = models.StateExiting
+	// Переводим в состояние EXITING через state machine
+	oldState := ps.Runtime.State
+	ForceTransition(ps.Runtime, models.StateExiting)
+	RecordTransition(oldState, models.StateExiting)
 	ps.mu.Unlock()
 
 	// Экстренное закрытие оставшейся ноги с retry
@@ -228,16 +230,20 @@ func (rm *RiskManager) HandleLiquidation(ctx context.Context, ps *PairState, eve
 
 	ps.mu.Lock()
 	if closeErr != nil {
-		// Ошибка закрытия - переводим в ERROR
-		ps.Runtime.State = models.StateError
+		// Ошибка закрытия - переводим в ERROR через state machine
+		oldState := ps.Runtime.State
+		ForceTransition(ps.Runtime, models.StateError)
+		RecordTransition(oldState, models.StateError)
 		ps.mu.Unlock()
 		rm.notifyError(ps, fmt.Errorf("emergency close failed after liquidation: %w", closeErr))
 		return closeErr
 	}
 
-	// Очищаем позицию и ставим на паузу
+	// Очищаем позицию и ставим на паузу через state machine
 	ps.Runtime.Legs = nil
-	ps.Runtime.State = models.StatePaused
+	oldState = ps.Runtime.State
+	ForceTransition(ps.Runtime, models.StatePaused)
+	RecordTransition(oldState, models.StatePaused)
 	ps.Config.Status = "paused"
 	ps.mu.Unlock()
 
