@@ -27,6 +27,33 @@ const (
 	bybitRecvWindow  = "5000"
 )
 
+// parseFloat парсит строку в float64 с логированием ошибок
+func (b *Bybit) parseFloat(value, field string) float64 {
+	result, err := strconv.ParseFloat(value, 64)
+	if err != nil && value != "" {
+		log.Printf("[bybit] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
+// parseInt парсит строку в int с логированием ошибок
+func (b *Bybit) parseInt(value, field string) int {
+	result, err := strconv.Atoi(value)
+	if err != nil && value != "" {
+		log.Printf("[bybit] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
+// parseInt64 парсит строку в int64 с логированием ошибок
+func (b *Bybit) parseInt64(value, field string) int64 {
+	result, err := strconv.ParseInt(value, 10, 64)
+	if err != nil && value != "" {
+		log.Printf("[bybit] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
 // Bybit реализует интерфейс Exchange для биржи Bybit
 type Bybit struct {
 	apiKey    string
@@ -37,11 +64,12 @@ type Bybit struct {
 	// WebSocket managers с автоматическим переподключением
 	wsPublicManager  *WSReconnectManager
 	wsPrivateManager *WSReconnectManager
+	wsMu             sync.Mutex // защита инициализации WebSocket managers
 
 	// Callbacks
-	tickerCallbacks   map[string]func(*Ticker)
-	positionCallback  func(*Position)
-	callbackMu        sync.RWMutex
+	tickerCallbacks  map[string]func(*Ticker)
+	positionCallback func(*Position)
+	callbackMu       sync.RWMutex
 
 	// State
 	connected bool
@@ -99,13 +127,7 @@ func (b *Bybit) doRequest(ctx context.Context, method, endpoint string, params m
 
 	if signed {
 		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-		var signPayload string
-		if method == http.MethodGet {
-			signPayload = reqBody
-		} else {
-			signPayload = reqBody
-		}
-		signature := b.sign(timestamp, signPayload)
+		signature := b.sign(timestamp, reqBody)
 
 		req.Header.Set("X-BAPI-API-KEY", b.apiKey)
 		req.Header.Set("X-BAPI-SIGN", signature)
@@ -194,8 +216,7 @@ func (b *Bybit) GetBalance(ctx context.Context) (float64, error) {
 	if len(resp.Result.List) > 0 && len(resp.Result.List[0].Coin) > 0 {
 		for _, coin := range resp.Result.List[0].Coin {
 			if coin.Coin == "USDT" {
-				equity, _ := strconv.ParseFloat(coin.Equity, 64)
-				return equity, nil
+				return b.parseFloat(coin.Equity, "equity"), nil
 			}
 		}
 	}
@@ -234,15 +255,11 @@ func (b *Bybit) GetTicker(ctx context.Context, symbol string) (*Ticker, error) {
 	}
 
 	t := resp.Result.List[0]
-	bidPrice, _ := strconv.ParseFloat(t.Bid1Price, 64)
-	askPrice, _ := strconv.ParseFloat(t.Ask1Price, 64)
-	lastPrice, _ := strconv.ParseFloat(t.LastPrice, 64)
-
 	return &Ticker{
 		Symbol:    t.Symbol,
-		BidPrice:  bidPrice,
-		AskPrice:  askPrice,
-		LastPrice: lastPrice,
+		BidPrice:  b.parseFloat(t.Bid1Price, "bid1Price"),
+		AskPrice:  b.parseFloat(t.Ask1Price, "ask1Price"),
+		LastPrice: b.parseFloat(t.LastPrice, "lastPrice"),
 		Timestamp: time.Now(),
 	}, nil
 }
@@ -284,15 +301,17 @@ func (b *Bybit) GetOrderBook(ctx context.Context, symbol string, depth int) (*Or
 	}
 
 	for i, bid := range resp.Result.Bids {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		volume, _ := strconv.ParseFloat(bid[1], 64)
-		orderBook.Bids[i] = PriceLevel{Price: price, Volume: volume}
+		orderBook.Bids[i] = PriceLevel{
+			Price:  b.parseFloat(bid[0], "bid.price"),
+			Volume: b.parseFloat(bid[1], "bid.volume"),
+		}
 	}
 
 	for i, ask := range resp.Result.Asks {
-		price, _ := strconv.ParseFloat(ask[0], 64)
-		volume, _ := strconv.ParseFloat(ask[1], 64)
-		orderBook.Asks[i] = PriceLevel{Price: price, Volume: volume}
+		orderBook.Asks[i] = PriceLevel{
+			Price:  b.parseFloat(ask[0], "ask.price"),
+			Volume: b.parseFloat(ask[1], "ask.volume"),
+		}
 	}
 
 	// Сортируем: bids по убыванию, asks по возрастанию
@@ -397,15 +416,12 @@ func (b *Bybit) getOrderExecution(ctx context.Context, symbol, orderId string) (
 	}
 
 	o := resp.Result.List[0]
-	filledQty, _ := strconv.ParseFloat(o.CumExecQty, 64)
-	avgPrice, _ := strconv.ParseFloat(o.AvgPrice, 64)
-
 	return &struct {
 		FilledQty float64
 		AvgPrice  float64
 	}{
-		FilledQty: filledQty,
-		AvgPrice:  avgPrice,
+		FilledQty: b.parseFloat(o.CumExecQty, "cumExecQty"),
+		AvgPrice:  b.parseFloat(o.AvgPrice, "avgPrice"),
 	}, nil
 }
 
@@ -442,16 +458,10 @@ func (b *Bybit) GetOpenPositions(ctx context.Context) ([]*Position, error) {
 
 	positions := make([]*Position, 0)
 	for _, p := range resp.Result.List {
-		size, _ := strconv.ParseFloat(p.Size, 64)
+		size := b.parseFloat(p.Size, "position.size")
 		if size == 0 {
 			continue
 		}
-
-		entryPrice, _ := strconv.ParseFloat(p.AvgPrice, 64)
-		markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-		leverage, _ := strconv.Atoi(p.Leverage)
-		unrealizedPnl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
-		updatedTime, _ := strconv.ParseInt(p.UpdatedTime, 10, 64)
 
 		side := SideLong
 		if p.Side == "Sell" {
@@ -462,12 +472,12 @@ func (b *Bybit) GetOpenPositions(ctx context.Context) ([]*Position, error) {
 			Symbol:        p.Symbol,
 			Side:          side,
 			Size:          size,
-			EntryPrice:    entryPrice,
-			MarkPrice:     markPrice,
-			Leverage:      leverage,
-			UnrealizedPnl: unrealizedPnl,
+			EntryPrice:    b.parseFloat(p.AvgPrice, "position.avgPrice"),
+			MarkPrice:     b.parseFloat(p.MarkPrice, "position.markPrice"),
+			Leverage:      b.parseInt(p.Leverage, "position.leverage"),
+			UnrealizedPnl: b.parseFloat(p.UnrealisedPnl, "position.unrealisedPnl"),
 			Liquidation:   p.PositionStatus == "Liq",
-			UpdatedAt:     time.UnixMilli(updatedTime),
+			UpdatedAt:     time.UnixMilli(b.parseInt64(p.UpdatedTime, "position.updatedTime")),
 		})
 	}
 
@@ -490,7 +500,8 @@ func (b *Bybit) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	b.tickerCallbacks[symbol] = callback
 	b.callbackMu.Unlock()
 
-	// Создаём WSReconnectManager если ещё не создан
+	// Защита от race condition при инициализации WebSocket manager
+	b.wsMu.Lock()
 	if b.wsPublicManager == nil {
 		config := DefaultWSReconnectConfig()
 		b.wsPublicManager = NewWSReconnectManager("bybit-public", bybitWSPublic, config)
@@ -512,9 +523,12 @@ func (b *Bybit) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 
 		// Подключаемся
 		if err := b.wsPublicManager.Connect(); err != nil {
+			b.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := b.wsPublicManager
+	b.wsMu.Unlock()
 
 	// Формируем сообщение подписки
 	subMsg := map[string]interface{}{
@@ -523,10 +537,10 @@ func (b *Bybit) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	}
 
 	// Добавляем подписку для восстановления после переподключения
-	b.wsPublicManager.AddSubscription(subMsg)
+	wsManager.AddSubscription(subMsg)
 
 	// Отправляем подписку
-	return b.wsPublicManager.Send(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 // handlePublicMessage обрабатывает одно сообщение из публичного WebSocket
@@ -553,15 +567,11 @@ func (b *Bybit) handlePublicMessage(message []byte) {
 		b.callbackMu.RUnlock()
 
 		if ok && callback != nil {
-			bidPrice, _ := strconv.ParseFloat(msg.Data.Bid1Price, 64)
-			askPrice, _ := strconv.ParseFloat(msg.Data.Ask1Price, 64)
-			lastPrice, _ := strconv.ParseFloat(msg.Data.LastPrice, 64)
-
 			callback(&Ticker{
 				Symbol:    symbol,
-				BidPrice:  bidPrice,
-				AskPrice:  askPrice,
-				LastPrice: lastPrice,
+				BidPrice:  b.parseFloat(msg.Data.Bid1Price, "ws.bid1Price"),
+				AskPrice:  b.parseFloat(msg.Data.Ask1Price, "ws.ask1Price"),
+				LastPrice: b.parseFloat(msg.Data.LastPrice, "ws.lastPrice"),
 				Timestamp: time.Now(),
 			})
 		}
@@ -573,7 +583,8 @@ func (b *Bybit) SubscribePositions(callback func(*Position)) error {
 	b.positionCallback = callback
 	b.callbackMu.Unlock()
 
-	// Создаём WSReconnectManager если ещё не создан
+	// Защита от race condition при инициализации WebSocket manager
+	b.wsMu.Lock()
 	if b.wsPrivateManager == nil {
 		config := DefaultWSReconnectConfig()
 		b.wsPrivateManager = NewWSReconnectManager("bybit-private", bybitWSPrivate, config)
@@ -598,9 +609,12 @@ func (b *Bybit) SubscribePositions(callback func(*Position)) error {
 
 		// Подключаемся
 		if err := b.wsPrivateManager.Connect(); err != nil {
+			b.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to private WebSocket: %w", err)
 		}
 	}
+	wsManager := b.wsPrivateManager
+	b.wsMu.Unlock()
 
 	// Формируем сообщение подписки
 	subMsg := map[string]interface{}{
@@ -609,10 +623,10 @@ func (b *Bybit) SubscribePositions(callback func(*Position)) error {
 	}
 
 	// Добавляем подписку для восстановления после переподключения
-	b.wsPrivateManager.AddSubscription(subMsg)
+	wsManager.AddSubscription(subMsg)
 
 	// Отправляем подписку
-	return b.wsPrivateManager.Send(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 func (b *Bybit) authenticateWebSocket(conn *websocket.Conn) error {
@@ -659,12 +673,6 @@ func (b *Bybit) handlePrivateMessage(message []byte) {
 
 		if callback != nil {
 			for _, p := range msg.Data {
-				size, _ := strconv.ParseFloat(p.Size, 64)
-				entryPrice, _ := strconv.ParseFloat(p.EntryPrice, 64)
-				markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-				leverage, _ := strconv.Atoi(p.Leverage)
-				unrealizedPnl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
-
 				side := SideLong
 				if p.Side == "Sell" {
 					side = SideShort
@@ -673,11 +681,11 @@ func (b *Bybit) handlePrivateMessage(message []byte) {
 				callback(&Position{
 					Symbol:        p.Symbol,
 					Side:          side,
-					Size:          size,
-					EntryPrice:    entryPrice,
-					MarkPrice:     markPrice,
-					Leverage:      leverage,
-					UnrealizedPnl: unrealizedPnl,
+					Size:          b.parseFloat(p.Size, "ws.position.size"),
+					EntryPrice:    b.parseFloat(p.EntryPrice, "ws.position.entryPrice"),
+					MarkPrice:     b.parseFloat(p.MarkPrice, "ws.position.markPrice"),
+					Leverage:      b.parseInt(p.Leverage, "ws.position.leverage"),
+					UnrealizedPnl: b.parseFloat(p.UnrealisedPnl, "ws.position.unrealisedPnl"),
 					Liquidation:   p.PositionStatus == "Liq",
 					UpdatedAt:     time.Now(),
 				})
@@ -711,8 +719,7 @@ func (b *Bybit) GetTradingFee(ctx context.Context, symbol string) (float64, erro
 	}
 
 	if len(resp.Result.List) > 0 {
-		fee, _ := strconv.ParseFloat(resp.Result.List[0].TakerFeeRate, 64)
-		return fee, nil
+		return b.parseFloat(resp.Result.List[0].TakerFeeRate, "takerFeeRate"), nil
 	}
 
 	return 0.00055, nil // 0.055% стандартная комиссия тейкера Bybit
@@ -757,20 +764,14 @@ func (b *Bybit) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 	}
 
 	info := resp.Result.List[0]
-	minOrderQty, _ := strconv.ParseFloat(info.LotSizeFilter.MinOrderQty, 64)
-	maxOrderQty, _ := strconv.ParseFloat(info.LotSizeFilter.MaxOrderQty, 64)
-	qtyStep, _ := strconv.ParseFloat(info.LotSizeFilter.QtyStep, 64)
-	priceStep, _ := strconv.ParseFloat(info.PriceFilter.TickSize, 64)
-	maxLeverage, _ := strconv.Atoi(info.LeverageFilter.MaxLeverage)
-
 	return &Limits{
 		Symbol:      symbol,
-		MinOrderQty: minOrderQty,
-		MaxOrderQty: maxOrderQty,
-		QtyStep:     qtyStep,
+		MinOrderQty: b.parseFloat(info.LotSizeFilter.MinOrderQty, "limits.minOrderQty"),
+		MaxOrderQty: b.parseFloat(info.LotSizeFilter.MaxOrderQty, "limits.maxOrderQty"),
+		QtyStep:     b.parseFloat(info.LotSizeFilter.QtyStep, "limits.qtyStep"),
 		MinNotional: 5.0, // Bybit минимум 5 USDT
-		PriceStep:   priceStep,
-		MaxLeverage: maxLeverage,
+		PriceStep:   b.parseFloat(info.PriceFilter.TickSize, "limits.tickSize"),
+		MaxLeverage: b.parseInt(info.LeverageFilter.MaxLeverage, "limits.maxLeverage"),
 	}, nil
 }
 
