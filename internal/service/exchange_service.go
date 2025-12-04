@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"arbitrage/internal/exchange"
@@ -35,7 +36,8 @@ type ExchangeService struct {
 	encryptionKey []byte
 
 	// Кэш активных соединений с биржами
-	connections map[string]exchange.Exchange
+	connections   map[string]exchange.Exchange
+	connectionsMu sync.RWMutex // Защита от race condition при конкурентном доступе
 
 	// WebSocket hub для broadcast балансов
 	wsHub BalanceBroadcaster
@@ -160,7 +162,9 @@ func (s *ExchangeService) ConnectExchange(ctx context.Context, name, apiKey, sec
 	}
 
 	// 8. Сохраняем соединение в кэше
+	s.connectionsMu.Lock()
 	s.connections[name] = exch
+	s.connectionsMu.Unlock()
 
 	return nil
 }
@@ -212,10 +216,12 @@ func (s *ExchangeService) DisconnectExchange(ctx context.Context, name string) e
 	}
 
 	// 3. Закрываем соединение с биржей (если есть в кэше)
+	s.connectionsMu.Lock()
 	if conn, exists := s.connections[name]; exists {
 		_ = conn.Close()
 		delete(s.connections, name)
 	}
+	s.connectionsMu.Unlock()
 
 	// 4. Помечаем биржу как отключенную и очищаем ключи
 	account.Connected = false
@@ -356,8 +362,12 @@ func (s *ExchangeService) GetExchangeByName(name string) (*models.ExchangeAccoun
 func (s *ExchangeService) GetConnection(ctx context.Context, name string) (exchange.Exchange, error) {
 	name = strings.ToLower(name)
 
-	// Проверяем кэш
-	if conn, exists := s.connections[name]; exists {
+	// Проверяем кэш (read lock)
+	s.connectionsMu.RLock()
+	conn, exists := s.connections[name]
+	s.connectionsMu.RUnlock()
+
+	if exists {
 		return conn, nil
 	}
 
@@ -404,8 +414,12 @@ func (s *ExchangeService) UpdateAllBalances(ctx context.Context) map[string]floa
 
 // getOrCreateConnection получает соединение из кэша или создает новое
 func (s *ExchangeService) getOrCreateConnection(ctx context.Context, name string, account *models.ExchangeAccount) (exchange.Exchange, error) {
-	// Проверяем кэш
-	if conn, exists := s.connections[name]; exists {
+	// Проверяем кэш (read lock)
+	s.connectionsMu.RLock()
+	conn, exists := s.connections[name]
+	s.connectionsMu.RUnlock()
+
+	if exists {
 		return conn, nil
 	}
 
@@ -429,7 +443,7 @@ func (s *ExchangeService) getOrCreateConnection(ctx context.Context, name string
 	}
 
 	// Создаем новое соединение
-	conn, err := exchange.NewExchange(name)
+	conn, err = exchange.NewExchange(name)
 	if err != nil {
 		return nil, err
 	}
@@ -438,8 +452,10 @@ func (s *ExchangeService) getOrCreateConnection(ctx context.Context, name string
 		return nil, err
 	}
 
-	// Сохраняем в кэш
+	// Сохраняем в кэш (write lock)
+	s.connectionsMu.Lock()
 	s.connections[name] = conn
+	s.connectionsMu.Unlock()
 
 	return conn, nil
 }
@@ -447,6 +463,9 @@ func (s *ExchangeService) getOrCreateConnection(ctx context.Context, name string
 // Close закрывает все соединения с биржами
 // Вызывается при graceful shutdown
 func (s *ExchangeService) Close() error {
+	s.connectionsMu.Lock()
+	defer s.connectionsMu.Unlock()
+
 	for name, conn := range s.connections {
 		_ = conn.Close()
 		delete(s.connections, name)
