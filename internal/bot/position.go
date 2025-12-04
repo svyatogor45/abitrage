@@ -157,8 +157,10 @@ func (pm *PositionManager) CheckPosition(ps *PairState) *PositionStatus {
 // checkExitConditions проверяет условия для закрытия позиции
 func (pm *PositionManager) checkExitConditions(ps *PairState, status *PositionStatus) (bool, string) {
 	// 1. Проверка exit spread
+	// ОПТИМИЗАЦИЯ: используем atomic read для lock-free доступа
 	// Выходим когда спред схлопнулся до exit_spread или ниже
-	if status.CurrentSpread <= ps.Config.ExitSpreadPct {
+	exitSpread := ps.GetExitSpread()
+	if status.CurrentSpread <= exitSpread {
 		return true, "exit_spread_reached"
 	}
 
@@ -175,8 +177,10 @@ func (pm *PositionManager) checkExitConditions(ps *PairState, status *PositionSt
 func (pm *PositionManager) checkStopLoss(ps *PairState, totalPnl float64) bool {
 	// Stop Loss срабатывает когда PNL падает ниже -StopLoss
 	// StopLoss задается в абсолютном значении USDT
-	if ps.Config.StopLoss > 0 {
-		if totalPnl <= -ps.Config.StopLoss {
+	// ОПТИМИЗАЦИЯ: используем atomic read для lock-free доступа
+	stopLoss := ps.GetStopLoss()
+	if stopLoss > 0 {
+		if totalPnl <= -stopLoss {
 			atomic.AddInt64(&pm.stopLossHits, 1)
 			return true
 		}
