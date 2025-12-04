@@ -10,6 +10,49 @@ import (
 	"arbitrage/internal/models"
 )
 
+// ============ ОПТИМИЗАЦИЯ: sync.Pool для EntryConditions ============
+// EntryConditions создаётся при каждой проверке арбитражных условий (100+/сек)
+// Пул уменьшает нагрузку на GC
+
+var entryConditionsPool = sync.Pool{
+	New: func() interface{} {
+		return &EntryConditions{
+			Warnings: make([]string, 0, 4), // Предаллокация на 4 предупреждения
+		}
+	},
+}
+
+// acquireEntryConditions получает объект из пула
+func acquireEntryConditions() *EntryConditions {
+	ec := entryConditionsPool.Get().(*EntryConditions)
+	// Сбрасываем поля (Warnings уже есть, просто обрезаем)
+	ec.CanEnter = false
+	ec.Reason = ""
+	ec.SpreadOK = false
+	ec.LiquidityOK = false
+	ec.MarginOK = false
+	ec.LimitsOK = false
+	ec.MaxArbitragesOK = false
+	ec.Opportunity = nil
+	ec.AdjustedVolume = 0
+	ec.Warnings = ec.Warnings[:0]
+	return ec
+}
+
+// ReleaseEntryConditions возвращает объект в пул
+// ВАЖНО: вызывать только когда объект больше не используется!
+// НЕ вызывать если CanEnter=true (объект будет использоваться в executeEntry)
+func ReleaseEntryConditions(ec *EntryConditions) {
+	if ec == nil {
+		return
+	}
+	// Очищаем ссылки для GC
+	ec.Opportunity = nil
+	ec.Reason = ""
+	ec.Warnings = ec.Warnings[:0]
+	entryConditionsPool.Put(ec)
+}
+
 // ============================================================
 // ArbitrageDetector - определение арбитражных возможностей
 // ============================================================
@@ -128,16 +171,17 @@ type EntryConditions struct {
 // 3. Достаточная маржа для открытия позиций
 // 4. Соблюдение лимитов бирж (min/max qty, lot size)
 // 5. Лимит максимальных одновременных арбитражей
+//
+// ОПТИМИЗАЦИЯ: использует sync.Pool для EntryConditions
+// Вызывающий код НЕ должен вызывать ReleaseEntryConditions если CanEnter=true
 func (ad *ArbitrageDetector) CheckEntryConditions(
 	ps *PairState,
 	currentArbitrages int64,
 	maxArbitrages int,
 	validator *OrderValidator,
 ) *EntryConditions {
-	result := &EntryConditions{
-		CanEnter: false,
-		Warnings: make([]string, 0),
-	}
+	// ОПТИМИЗАЦИЯ: получаем из пула
+	result := acquireEntryConditions()
 
 	config := ps.Config
 	symbol := config.Symbol
@@ -184,6 +228,8 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 	// 3. Проверка ликвидности
 	if !liquidityOK {
 		result.Reason = "insufficient liquidity: " + liquidityIssue
+		ReleaseArbitrageOpportunity(opp) // Освобождаем opp
+		result.Opportunity = nil
 		return result
 	}
 	result.LiquidityOK = true
@@ -192,6 +238,8 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 	if opp.NetSpread < config.EntrySpreadPct {
 		result.Reason = fmt.Sprintf("spread %.4f%% < entry threshold %.4f%%",
 			opp.NetSpread, config.EntrySpreadPct)
+		ReleaseArbitrageOpportunity(opp) // Освобождаем opp
+		result.Opportunity = nil
 		return result
 	}
 	result.SpreadOK = true
@@ -210,6 +258,8 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 
 		if !validation.Valid {
 			result.Reason = "order validation failed: " + validation.Error
+			ReleaseArbitrageOpportunity(opp) // Освобождаем opp
+			result.Opportunity = nil
 			return result
 		}
 
@@ -225,6 +275,8 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 
 	if !marginOK {
 		result.Reason = marginReason
+		ReleaseArbitrageOpportunity(opp) // Освобождаем opp
+		result.Opportunity = nil
 		return result
 	}
 	result.MarginOK = true
@@ -233,6 +285,8 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 	result.CanEnter = true
 	atomic.AddInt64(&ad.entriesTriggered, 1)
 
+	// НЕ освобождаем opp - он будет использован в executeEntry
+	// НЕ освобождаем result - он будет использован в executeEntry
 	return result
 }
 

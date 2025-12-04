@@ -22,6 +22,42 @@ const (
 // BestPrices достаточно маленький (~130 байт), аллокация занимает ~25ns.
 // При ~1000 обновлений/сек это всего 25µs - пренебрежимо мало.
 
+// ============ ОПТИМИЗАЦИЯ: sync.Pool для ArbitrageOpportunity ============
+// ArbitrageOpportunity создаётся при каждом успешном DetectOpportunity
+// При высокой частоте проверок (100+/сек) это создаёт нагрузку на GC
+//
+// ВАЖНО: вызывающий код ДОЛЖЕН вызвать ReleaseArbitrageOpportunity после использования!
+// Если объект используется в горутине, Release вызывать в конце горутины.
+
+var arbitrageOpportunityPool = sync.Pool{
+	New: func() interface{} {
+		return &ArbitrageOpportunity{}
+	},
+}
+
+// acquireArbitrageOpportunity получает объект из пула
+func acquireArbitrageOpportunity() *ArbitrageOpportunity {
+	return arbitrageOpportunityPool.Get().(*ArbitrageOpportunity)
+}
+
+// ReleaseArbitrageOpportunity возвращает объект в пул
+// ВАЖНО: вызывать только когда объект больше не используется!
+func ReleaseArbitrageOpportunity(opp *ArbitrageOpportunity) {
+	if opp == nil {
+		return
+	}
+	// Очищаем перед возвратом (избегаем утечки памяти на строки)
+	opp.Symbol = ""
+	opp.LongExchange = ""
+	opp.ShortExchange = ""
+	opp.LongPrice = 0
+	opp.ShortPrice = 0
+	opp.RawSpread = 0
+	opp.NetSpread = 0
+	opp.Timestamp = time.Time{}
+	arbitrageOpportunityPool.Put(opp)
+}
+
 // fnvHash вычисляет FNV-1a hash строки БЕЗ аллокаций
 // В отличие от fnv.New32a() не создаёт объект на куче
 // Экономит ~2000+ аллокаций/сек в горячем пути
@@ -375,6 +411,9 @@ func (sc *SpreadCalculator) SetFee(exchange string, fee float64) {
 
 // GetBestOpportunity возвращает лучшую арбитражную возможность
 // Сложность: O(1) - все данные уже предвычислены в PriceTracker
+//
+// ОПТИМИЗАЦИЯ: использует sync.Pool для объектов ArbitrageOpportunity
+// ВАЖНО: вызывающий код ДОЛЖЕН вызвать ReleaseArbitrageOpportunity() после использования!
 func (sc *SpreadCalculator) GetBestOpportunity(symbol string) *ArbitrageOpportunity {
 	best := sc.tracker.GetBestPrices(symbol)
 	if best == nil {
@@ -394,16 +433,18 @@ func (sc *SpreadCalculator) GetBestOpportunity(symbol string) *ArbitrageOpportun
 	// Рассчитываем чистый спред с учётом комиссий
 	netSpread := sc.calculateNetSpread(best)
 
-	return &ArbitrageOpportunity{
-		Symbol:        symbol,
-		LongExchange:  best.BestAskExch,
-		LongPrice:     best.BestAsk,
-		ShortExchange: best.BestBidExch,
-		ShortPrice:    best.BestBid,
-		RawSpread:     best.RawSpread,
-		NetSpread:     netSpread,
-		Timestamp:     best.BestAskTime, // Используем timestamp из события (проблема 8)
-	}
+	// ОПТИМИЗАЦИЯ: получаем из пула вместо new()
+	opp := acquireArbitrageOpportunity()
+	opp.Symbol = symbol
+	opp.LongExchange = best.BestAskExch
+	opp.LongPrice = best.BestAsk
+	opp.ShortExchange = best.BestBidExch
+	opp.ShortPrice = best.BestBid
+	opp.RawSpread = best.RawSpread
+	opp.NetSpread = netSpread
+	opp.Timestamp = best.BestAskTime
+
+	return opp
 }
 
 // calculateNetSpread вычисляет чистый спред после комиссий
