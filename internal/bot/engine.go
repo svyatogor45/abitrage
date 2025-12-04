@@ -474,14 +474,11 @@ func (e *Engine) enqueueNotification(notif *models.Notification) {
 		return
 	}
 
-	select {
-	case e.notificationChan <- notif:
+	if tryEnqueueNotification(e.notificationChan, notif) {
 		return
-	default:
-		RecordBufferOverflow("notification")
-		RecordBufferBacklog("notification", cap(e.notificationChan), len(e.notificationChan))
-		releaseNotification(notif)
 	}
+
+	releaseNotification(notif)
 }
 
 // enqueuePositionUpdate добавляет обновление позиции, не блокируя отправителя

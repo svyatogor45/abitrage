@@ -792,6 +792,46 @@ func TestOrderBookAnalyzerAnalyzeLiquidityInsufficient(t *testing.T) {
 	}
 }
 
+func TestOrderBookAnalyzerAnalyzeLiquidityThrottle(t *testing.T) {
+	oba := NewOrderBookAnalyzer(5, 5*time.Second)
+	oba.minAnalyzeInterval = 200 * time.Millisecond
+
+	symbol := "THROTTLE"
+
+	// Начальные стаканы
+	oba.UpdateOrderBook(symbol, "EX_LONG", []PriceLevel{{Price: 99.5, Volume: 5}}, []PriceLevel{{Price: 100, Volume: 5}})
+	oba.UpdateOrderBook(symbol, "EX_SHORT", []PriceLevel{{Price: 101.5, Volume: 5}}, []PriceLevel{{Price: 102, Volume: 5}})
+
+	first := oba.AnalyzeLiquidity(symbol, 2.0, "EX_LONG", "EX_SHORT")
+	if first == nil {
+		t.Fatal("expected first analysis")
+	}
+
+	// Резко меняем стаканы, но вызываем сразу — должен сработать кэш
+	oba.UpdateOrderBook(symbol, "EX_LONG", []PriceLevel{{Price: 110, Volume: 5}}, []PriceLevel{{Price: 111, Volume: 5}})
+	oba.UpdateOrderBook(symbol, "EX_SHORT", []PriceLevel{{Price: 90, Volume: 5}}, []PriceLevel{{Price: 91, Volume: 5}})
+
+	cached := oba.AnalyzeLiquidity(symbol, 2.0, "EX_LONG", "EX_SHORT")
+	if cached == nil {
+		t.Fatal("expected cached analysis")
+	}
+
+	if abs(cached.AdjustedSpread-first.AdjustedSpread) > 1e-9 {
+		t.Fatalf("expected cached spread %f to match first %f", cached.AdjustedSpread, first.AdjustedSpread)
+	}
+
+	time.Sleep(oba.minAnalyzeInterval + 10*time.Millisecond)
+
+	refreshed := oba.AnalyzeLiquidity(symbol, 2.0, "EX_LONG", "EX_SHORT")
+	if refreshed == nil {
+		t.Fatal("expected refreshed analysis")
+	}
+
+	if abs(refreshed.AdjustedSpread-first.AdjustedSpread) < 0.01 {
+		t.Fatalf("expected refreshed spread to differ after throttle window, first=%f refreshed=%f", first.AdjustedSpread, refreshed.AdjustedSpread)
+	}
+}
+
 func TestPriceTrackerUsesOrderBookAnalyzerForVWAP(t *testing.T) {
 	pt := NewPriceTracker(1)
 	oba := NewOrderBookAnalyzer(5, 5*time.Second)

@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -653,6 +654,12 @@ type OrderBookAnalyzer struct {
 	// Key: OrderBookKey{Symbol, Exchange}
 	orderBooks sync.Map
 
+	// Кэш результатов AnalyzeLiquidity для дедупликации частых запросов
+	liquidityCache sync.Map
+
+	// Минимальный интервал между повторными анализами по одному ключу
+	minAnalyzeInterval time.Duration
+
 	// Глубина анализа (количество уровней)
 	depth int
 
@@ -671,6 +678,18 @@ type CachedOrderBook struct {
 	Bids      []PriceLevel // заявки на покупку (от высокой к низкой)
 	Asks      []PriceLevel // заявки на продажу (от низкой к высокой)
 	Timestamp time.Time
+}
+
+type liquidityCacheKey struct {
+	symbol       string
+	longExch     string
+	shortExch    string
+	volumeBucket int64
+}
+
+type liquidityCacheEntry struct {
+	lastCalc atomic.Int64
+	result   atomic.Pointer[LiquidityAnalysis]
 }
 
 // PriceLevel - уровень цены в стакане
@@ -731,9 +750,23 @@ func NewOrderBookAnalyzer(depth int, maxAge time.Duration) *OrderBookAnalyzer {
 	}
 
 	return &OrderBookAnalyzer{
-		depth:  depth,
-		maxAge: maxAge,
+		depth:              depth,
+		maxAge:             maxAge,
+		minAnalyzeInterval: 50 * time.Millisecond,
 	}
+}
+
+func liquidityVolumeBucket(volume float64) int64 {
+	// Биндим объёмы с шагом 1e-3 чтобы избежать бесконечного роста ключей и не искажать точность
+	return int64(volume * 1000)
+}
+
+func copyLiquidityAnalysis(src *LiquidityAnalysis) *LiquidityAnalysis {
+	if src == nil {
+		return nil
+	}
+	dst := *src
+	return &dst
 }
 
 // UpdateOrderBook обновляет кэшированный стакан
@@ -876,6 +909,24 @@ func (oba *OrderBookAnalyzer) AnalyzeLiquidity(
 	longExchange string, // биржа для лонга (покупка)
 	shortExchange string, // биржа для шорта (продажа)
 ) *LiquidityAnalysis {
+	cacheKey := liquidityCacheKey{
+		symbol:       symbol,
+		longExch:     longExchange,
+		shortExch:    shortExchange,
+		volumeBucket: liquidityVolumeBucket(volume),
+	}
+
+	now := time.Now().UnixNano()
+	if entry, ok := oba.liquidityCache.Load(cacheKey); ok {
+		cached := entry.(*liquidityCacheEntry)
+		last := cached.lastCalc.Load()
+		if last > 0 && time.Duration(now-last) < oba.minAnalyzeInterval {
+			if cachedResult := cached.result.Load(); cachedResult != nil {
+				return copyLiquidityAnalysis(cachedResult)
+			}
+		}
+	}
+
 	analysis := &LiquidityAnalysis{
 		Symbol:        symbol,
 		Volume:        volume,
@@ -933,6 +984,11 @@ func (oba *OrderBookAnalyzer) AnalyzeLiquidity(
 		analysis.Warnings = append(analysis.Warnings,
 			"high total slippage: "+formatPercent(totalSlippage))
 	}
+
+	entryAny, _ := oba.liquidityCache.LoadOrStore(cacheKey, &liquidityCacheEntry{})
+	entry := entryAny.(*liquidityCacheEntry)
+	entry.result.Store(analysis)
+	entry.lastCalc.Store(now)
 
 	return analysis
 }

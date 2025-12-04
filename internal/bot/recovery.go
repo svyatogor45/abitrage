@@ -35,7 +35,7 @@ type RecoveryManager struct {
 	encryptionKey []byte
 
 	// Обработчик уведомлений
-	notificationChan chan<- *models.Notification
+	notificationChan chan *models.Notification
 
 	// Engine для добавления бирж и пар
 	engine *Engine
@@ -68,7 +68,7 @@ func NewRecoveryManager(
 	exchangeRepo *repository.ExchangeRepository,
 	pairRepo *repository.PairRepository,
 	engine *Engine,
-	notificationChan chan<- *models.Notification,
+	notificationChan chan *models.Notification,
 	recoveryConfig *RecoveryConfig,
 ) *RecoveryManager {
 	if recoveryConfig == nil {
@@ -641,11 +641,7 @@ func (rm *RecoveryManager) notify(notifType, severity, message string, meta map[
 		Meta:      meta,
 	}
 
-	select {
-	case rm.notificationChan <- notif:
-	default:
-		// Канал заполнен, пропускаем
-	}
+	tryEnqueueNotification(rm.notificationChan, notif)
 }
 
 // RecoverAsync запускает восстановление асинхронно и возвращает канал с результатом

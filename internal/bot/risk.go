@@ -34,7 +34,7 @@ type RiskManager struct {
 	limitsCache sync.Map // map[LimitsKey]*exchange.Limits
 
 	// Канал для уведомлений
-	notificationChan chan<- *models.Notification
+	notificationChan chan *models.Notification
 
 	// Callback для закрытия позиций
 	closePositionFn func(ctx context.Context, ps *PairState, reason ExitReason) error
@@ -90,7 +90,7 @@ type MarginInfo struct {
 
 // NewRiskManager создает новый RiskManager
 func NewRiskManager(
-	notifChan chan<- *models.Notification,
+	notifChan chan *models.Notification,
 	closePosFn func(ctx context.Context, ps *PairState, reason ExitReason) error,
 	pauseFn func(pairID int),
 	config RiskConfig,
@@ -505,11 +505,7 @@ func (rm *RiskManager) notifyStopLoss(ps *PairState) {
 		},
 	}
 
-	select {
-	case rm.notificationChan <- notif:
-	default:
-		// Канал заполнен
-	}
+	tryEnqueueNotification(rm.notificationChan, notif)
 }
 
 // notifyLiquidation отправляет уведомление о ликвидации
@@ -534,10 +530,7 @@ func (rm *RiskManager) notifyLiquidation(ps *PairState, event LiquidationEvent) 
 		},
 	}
 
-	select {
-	case rm.notificationChan <- notif:
-	default:
-	}
+	tryEnqueueNotification(rm.notificationChan, notif)
 }
 
 // notifyMarginInsufficient отправляет уведомление о недостатке маржи
@@ -563,10 +556,7 @@ func (rm *RiskManager) notifyMarginInsufficient(ps *PairState, check *MarginChec
 		},
 	}
 
-	select {
-	case rm.notificationChan <- notif:
-	default:
-	}
+	tryEnqueueNotification(rm.notificationChan, notif)
 }
 
 // notifyError отправляет уведомление об ошибке
@@ -588,10 +578,7 @@ func (rm *RiskManager) notifyError(ps *PairState, err error) {
 		},
 	}
 
-	select {
-	case rm.notificationChan <- notif:
-	default:
-	}
+	tryEnqueueNotification(rm.notificationChan, notif)
 }
 
 // ============================================================
