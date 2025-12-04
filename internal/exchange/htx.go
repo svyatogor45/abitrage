@@ -31,6 +31,7 @@ type HTX struct {
 
 	// WebSocket manager с автоматическим переподключением
 	wsManager *WSReconnectManager
+	wsMu      sync.Mutex // защита инициализации WebSocket manager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -465,6 +466,7 @@ func (h *HTX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	h.tickerCallbacks[symbol] = callback
 	h.callbackMu.Unlock()
 
+	h.wsMu.Lock()
 	if h.wsManager == nil {
 		config := DefaultWSReconnectConfig()
 		h.wsManager = NewWSReconnectManager("htx", htxWSURL, config)
@@ -480,9 +482,12 @@ func (h *HTX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		})
 
 		if err := h.wsManager.Connect(); err != nil {
+			h.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := h.wsManager
+	h.wsMu.Unlock()
 
 	contract := h.toHTXSymbol(symbol)
 	subMsg := map[string]interface{}{
@@ -490,8 +495,8 @@ func (h *HTX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		"id":  fmt.Sprintf("ticker_%s", contract),
 	}
 
-	h.wsManager.AddSubscription(subMsg)
-	return h.wsManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 // handleMessage обрабатывает одно сообщение из WebSocket
@@ -608,10 +613,12 @@ func (h *HTX) Close() error {
 		close(h.closeChan)
 	}
 
+	h.wsMu.Lock()
 	if h.wsManager != nil {
 		h.wsManager.Close()
 		h.wsManager = nil
 	}
+	h.wsMu.Unlock()
 
 	h.connected = false
 	return nil
