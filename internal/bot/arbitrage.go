@@ -235,9 +235,11 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 	result.LiquidityOK = true
 
 	// 4. Проверка спреда
-	if opp.NetSpread < config.EntrySpreadPct {
+	// ОПТИМИЗАЦИЯ: используем atomic read для lock-free доступа в горячем пути
+	entrySpread := ps.GetEntrySpread()
+	if opp.NetSpread < entrySpread {
 		result.Reason = fmt.Sprintf("spread %.4f%% < entry threshold %.4f%%",
-			opp.NetSpread, config.EntrySpreadPct)
+			opp.NetSpread, entrySpread)
 		ReleaseArbitrageOpportunity(opp) // Освобождаем opp
 		result.Opportunity = nil
 		return result
@@ -359,6 +361,11 @@ func (ad *ArbitrageDetector) CheckExitConditions(ps *PairState) *ExitConditions 
 	config := ps.Config
 	runtime := ps.Runtime
 
+	// Защита от nil runtime
+	if runtime == nil {
+		return result
+	}
+
 	// Проверяем только если есть открытая позиция
 	if runtime.State != models.StateHolding || len(runtime.Legs) != 2 {
 		return result
@@ -396,7 +403,9 @@ func (ad *ArbitrageDetector) CheckExitConditions(ps *PairState) *ExitConditions 
 	result.CurrentPnl = currentPnl
 
 	// 3. Проверяем Stop Loss
-	if config.StopLoss > 0 && currentPnl <= -config.StopLoss {
+	// ОПТИМИЗАЦИЯ: используем atomic read для lock-free доступа
+	stopLoss := ps.GetStopLoss()
+	if stopLoss > 0 && currentPnl <= -stopLoss {
 		result.ShouldExit = true
 		result.Reason = ExitReasonStopLoss
 		atomic.AddInt64(&ad.exitsTriggered, 1)
@@ -404,8 +413,9 @@ func (ad *ArbitrageDetector) CheckExitConditions(ps *PairState) *ExitConditions 
 	}
 
 	// 4. Проверяем достижение спреда выхода
-	// Спред выхода обычно <= 0 или близок к нулю
-	if currentSpread <= config.ExitSpreadPct {
+	// ОПТИМИЗАЦИЯ: используем atomic read для lock-free доступа
+	exitSpread := ps.GetExitSpread()
+	if currentSpread <= exitSpread {
 		result.ShouldExit = true
 		result.Reason = ExitReasonSpread
 		atomic.AddInt64(&ad.exitsTriggered, 1)
@@ -511,9 +521,12 @@ func (pem *PartialEntryManager) ExecutePartialEntry(
 				if opp != nil {
 					result.Error = fmt.Errorf("spread degraded to %.4f%%, stopping at part %d/%d",
 						opp.NetSpread, i, params.NOrders)
+					ReleaseArbitrageOpportunity(opp) // Освобождаем перед выходом
 				}
 				break
 			}
+			// ВАЖНО: освобождаем opp после проверки - он больше не нужен
+			ReleaseArbitrageOpportunity(opp)
 		}
 
 		// Выполняем часть входа
