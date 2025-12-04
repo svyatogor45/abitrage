@@ -806,6 +806,8 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 			NOrders:       ps.Config.NOrders,
 			LongExchange:  opp.LongExchange,
 			ShortExchange: opp.ShortExchange,
+			EntrySpread:   ps.GetEntrySpread(),
+			ExitSpread:    ps.GetExitSpread(),
 			MinSpread:     ps.GetEntrySpread() * 0.8, // 80% от entry spread (atomic read)
 		})
 

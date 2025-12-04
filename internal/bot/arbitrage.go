@@ -468,7 +468,9 @@ type PartialEntryParams struct {
 	NOrders       int
 	LongExchange  string
 	ShortExchange string
-	MinSpread     float64 // минимальный спред для продолжения
+	EntrySpread   float64 // порог входа
+	ExitSpread    float64 // порог выхода (для немедленного стопа частями)
+	MinSpread     float64 // минимальный спред для продолжения (зона деградации)
 }
 
 // PartialEntryResult результат частичного входа
@@ -518,6 +520,11 @@ func (pem *PartialEntryManager) ExecutePartialEntry(
 	}
 
 	partVolume := params.TotalVolume / float64(params.NOrders)
+	entrySpread := params.EntrySpread
+	if entrySpread <= 0 {
+		entrySpread = params.MinSpread
+	}
+	exitSpread := params.ExitSpread
 
 	// Аккумуляторы для ног
 	var totalLongQty, totalShortQty float64
@@ -533,22 +540,44 @@ func (pem *PartialEntryManager) ExecutePartialEntry(
 		default:
 		}
 
-		// Проверяем текущий спред (кроме первой части)
-		if i > 0 {
-			opp := pem.detector.DetectOpportunity(params.Symbol)
-			if opp == nil || opp.NetSpread < params.MinSpread {
-				// Спред ухудшился - останавливаем вход
-				result.Success = result.FilledParts > 0
-				if opp != nil {
-					result.Error = fmt.Errorf("spread degraded to %.4f%%, stopping at part %d/%d",
-						opp.NetSpread, i, params.NOrders)
-					ReleaseArbitrageOpportunity(opp) // Освобождаем перед выходом
-				}
-				break
-			}
-			// ВАЖНО: освобождаем opp после проверки - он больше не нужен
-			ReleaseArbitrageOpportunity(opp)
+		// Перед каждой частью пересчитываем спред и ликвидность (VWAP 5 уровней)
+		spreadWithLiq := pem.detector.DetectWithLiquidity(params.Symbol, partVolume)
+		if spreadWithLiq == nil || spreadWithLiq.ArbitrageOpportunity == nil {
+			result.Error = fmt.Errorf("no arbitrage opportunity before part %d/%d", i+1, params.NOrders)
+			return result
 		}
+
+		opportunity := spreadWithLiq.ArbitrageOpportunity
+		currentSpread := opportunity.NetSpread
+
+		// Проверка выхода: спред сузился до exit или ниже — закрываем уже открытую часть
+		if exitSpread > 0 && currentSpread <= exitSpread && result.FilledParts > 0 {
+			closeErr := pem.closeFilledParts(ctx, params.Symbol, params.LongExchange, params.ShortExchange, totalLongQty, totalShortQty, longPriceSum, shortPriceSum)
+			result.Error = fmt.Errorf("spread tightened to %.4f%% (exit %.4f%%) at part %d/%d", currentSpread, exitSpread, i+1, params.NOrders)
+			if closeErr != nil {
+				result.PartialErrors = append(result.PartialErrors, closeErr)
+			}
+			ReleaseArbitrageOpportunity(opportunity)
+			return result
+		}
+
+		// Проверка входа: ниже порога — приостанавливаем дальнейший набор
+		if currentSpread < entrySpread {
+			result.Success = result.FilledParts > 0
+			result.Error = fmt.Errorf("spread degraded to %.4f%% (entry %.4f%%) at part %d/%d", currentSpread, entrySpread, i+1, params.NOrders)
+			ReleaseArbitrageOpportunity(opportunity)
+			break
+		}
+
+		// Проверка ликвидности
+		if !spreadWithLiq.IsLiquidityOK {
+			result.Success = result.FilledParts > 0
+			result.Error = fmt.Errorf("insufficient liquidity before part %d/%d: %s", i+1, params.NOrders, spreadWithLiq.LiquidityIssue)
+			ReleaseArbitrageOpportunity(opportunity)
+			break
+		}
+
+		ReleaseArbitrageOpportunity(opportunity)
 
 		// Выполняем часть входа
 		execParams := ExecuteParams{
@@ -608,6 +637,48 @@ func (pem *PartialEntryManager) ExecutePartialEntry(
 	}
 
 	return result
+}
+
+// closeFilledParts закрывает уже открытые части параллельно, если спред сузился до порога выхода
+// Возвращает ошибку только если закрытие не удалось (чтобы поднять уведомление об аварии)
+func (pem *PartialEntryManager) closeFilledParts(
+	ctx context.Context,
+	symbol string,
+	longExchange string,
+	shortExchange string,
+	longQty float64,
+	shortQty float64,
+	longPriceSum float64,
+	shortPriceSum float64,
+) error {
+	if longQty <= 0 || shortQty <= 0 {
+		return nil
+	}
+
+	legs := []models.Leg{
+		{
+			Exchange:   longExchange,
+			Side:       "long",
+			EntryPrice: longPriceSum / longQty,
+			Quantity:   longQty,
+		},
+		{
+			Exchange:   shortExchange,
+			Side:       "short",
+			EntryPrice: shortPriceSum / shortQty,
+			Quantity:   shortQty,
+		},
+	}
+
+	closeResult := pem.orderExec.CloseParallel(ctx, CloseParams{Symbol: symbol, Legs: legs})
+	if closeResult == nil {
+		return fmt.Errorf("closeFilledParts: CloseParallel returned nil")
+	}
+	if !closeResult.Success {
+		return fmt.Errorf("closeFilledParts: %w", closeResult.Error)
+	}
+
+	return nil
 }
 
 // ============================================================
@@ -873,6 +944,8 @@ func (ac *ArbitrageCoordinator) TryEnter(ctx context.Context, ps *PairState) (bo
 			NOrders:       config.NOrders,
 			LongExchange:  opp.LongExchange,
 			ShortExchange: opp.ShortExchange,
+			EntrySpread:   config.EntrySpreadPct,
+			ExitSpread:    config.ExitSpreadPct,
 			MinSpread:     config.EntrySpreadPct * 0.8, // 80% от entry spread
 		})
 
