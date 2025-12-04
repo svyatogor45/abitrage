@@ -35,6 +35,7 @@ type OKX struct {
 	// WebSocket managers с автоматическим переподключением
 	wsPublicManager  *WSReconnectManager
 	wsPrivateManager *WSReconnectManager
+	wsMu             sync.Mutex // защита инициализации WebSocket managers
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -60,6 +61,33 @@ func (o *OKX) sign(timestamp, method, requestPath, body string) string {
 	h := hmac.New(sha256.New, []byte(o.secretKey))
 	h.Write([]byte(message))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// parseFloat парсит строку в float64 с логированием ошибок
+func (o *OKX) parseFloat(value, field string) float64 {
+	result, err := strconv.ParseFloat(value, 64)
+	if err != nil && value != "" {
+		log.Printf("[okx] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
+// parseInt парсит строку в int с логированием ошибок
+func (o *OKX) parseInt(value, field string) int {
+	result, err := strconv.Atoi(value)
+	if err != nil && value != "" {
+		log.Printf("[okx] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
+// parseInt64 парсит строку в int64 с логированием ошибок
+func (o *OKX) parseInt64(value, field string) int64 {
+	result, err := strconv.ParseInt(value, 10, 64)
+	if err != nil && value != "" {
+		log.Printf("[okx] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
 }
 
 func (o *OKX) doRequest(ctx context.Context, method, endpoint string, params map[string]string, signed bool) ([]byte, error) {
@@ -187,7 +215,7 @@ func (o *OKX) GetBalance(ctx context.Context) (float64, error) {
 	if len(resp.Data) > 0 {
 		for _, detail := range resp.Data[0].Details {
 			if detail.Ccy == "USDT" {
-				equity, _ := strconv.ParseFloat(detail.Eq, 64)
+				equity := o.parseFloat(detail.Eq, "accountEquity")
 				return equity, nil
 			}
 		}
@@ -228,10 +256,10 @@ func (o *OKX) GetTicker(ctx context.Context, symbol string) (*Ticker, error) {
 	}
 
 	t := resp.Data[0]
-	bidPrice, _ := strconv.ParseFloat(t.BidPx, 64)
-	askPrice, _ := strconv.ParseFloat(t.AskPx, 64)
-	lastPrice, _ := strconv.ParseFloat(t.Last, 64)
-	ts, _ := strconv.ParseInt(t.Ts, 10, 64)
+	bidPrice := o.parseFloat(t.BidPx, "bidPx")
+	askPrice := o.parseFloat(t.AskPx, "askPx")
+	lastPrice := o.parseFloat(t.Last, "last")
+	ts := o.parseInt64(t.Ts, "timestamp")
 
 	return &Ticker{
 		Symbol:    symbol,
@@ -276,7 +304,7 @@ func (o *OKX) GetOrderBook(ctx context.Context, symbol string, depth int) (*Orde
 	}
 
 	data := resp.Data[0]
-	ts, _ := strconv.ParseInt(data.Ts, 10, 64)
+	ts := o.parseInt64(data.Ts, "orderbook.ts")
 
 	orderBook := &OrderBook{
 		Symbol:    symbol,
@@ -286,14 +314,14 @@ func (o *OKX) GetOrderBook(ctx context.Context, symbol string, depth int) (*Orde
 	}
 
 	for i, bid := range data.Bids {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		volume, _ := strconv.ParseFloat(bid[1], 64)
+		price := o.parseFloat(bid[0], "bid.price")
+		volume := o.parseFloat(bid[1], "bid.volume")
 		orderBook.Bids[i] = PriceLevel{Price: price, Volume: volume}
 	}
 
 	for i, ask := range data.Asks {
-		price, _ := strconv.ParseFloat(ask[0], 64)
-		volume, _ := strconv.ParseFloat(ask[1], 64)
+		price := o.parseFloat(ask[0], "ask.price")
+		volume := o.parseFloat(ask[1], "ask.volume")
 		orderBook.Asks[i] = PriceLevel{Price: price, Volume: volume}
 	}
 
@@ -402,8 +430,8 @@ func (o *OKX) getOrderDetail(ctx context.Context, instId, orderId string) (*stru
 		return nil, fmt.Errorf("order not found")
 	}
 
-	filledQty, _ := strconv.ParseFloat(resp.Data[0].AccFillSz, 64)
-	avgPrice, _ := strconv.ParseFloat(resp.Data[0].AvgPx, 64)
+	filledQty := o.parseFloat(resp.Data[0].AccFillSz, "accFillSz")
+	avgPrice := o.parseFloat(resp.Data[0].AvgPx, "avgPx")
 
 	return &struct {
 		FilledQty float64
@@ -444,16 +472,16 @@ func (o *OKX) GetOpenPositions(ctx context.Context) ([]*Position, error) {
 
 	positions := make([]*Position, 0)
 	for _, p := range resp.Data {
-		pos, _ := strconv.ParseFloat(p.Pos, 64)
+		pos := o.parseFloat(p.Pos, "position.pos")
 		if pos == 0 {
 			continue
 		}
 
-		entryPrice, _ := strconv.ParseFloat(p.AvgPx, 64)
-		markPrice, _ := strconv.ParseFloat(p.MarkPx, 64)
-		leverage, _ := strconv.Atoi(p.Lever)
-		unrealizedPnl, _ := strconv.ParseFloat(p.Upl, 64)
-		uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
+		entryPrice := o.parseFloat(p.AvgPx, "position.avgPx")
+		markPrice := o.parseFloat(p.MarkPx, "position.markPx")
+		leverage := o.parseInt(p.Lever, "position.lever")
+		unrealizedPnl := o.parseFloat(p.Upl, "position.upl")
+		uTime := o.parseInt64(p.UTime, "position.uTime")
 
 		side := SideLong
 		if p.PosSide == "short" {
@@ -505,6 +533,8 @@ func (o *OKX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	o.tickerCallbacks[symbol] = callback
 	o.callbackMu.Unlock()
 
+	// Защита от race condition при инициализации WebSocket manager
+	o.wsMu.Lock()
 	if o.wsPublicManager == nil {
 		config := DefaultWSReconnectConfig()
 		o.wsPublicManager = NewWSReconnectManager("okx-public", okxWSPublic, config)
@@ -520,9 +550,12 @@ func (o *OKX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		})
 
 		if err := o.wsPublicManager.Connect(); err != nil {
+			o.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := o.wsPublicManager
+	o.wsMu.Unlock()
 
 	instId := o.toOKXSymbol(symbol)
 	subMsg := map[string]interface{}{
@@ -535,8 +568,8 @@ func (o *OKX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		},
 	}
 
-	o.wsPublicManager.AddSubscription(subMsg)
-	return o.wsPublicManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 // handlePublicMessage обрабатывает одно сообщение из публичного WebSocket
@@ -567,10 +600,10 @@ func (o *OKX) handlePublicMessage(message []byte) {
 
 		if ok && callback != nil {
 			d := msg.Data[0]
-			bidPrice, _ := strconv.ParseFloat(d.BidPx, 64)
-			askPrice, _ := strconv.ParseFloat(d.AskPx, 64)
-			lastPrice, _ := strconv.ParseFloat(d.Last, 64)
-			ts, _ := strconv.ParseInt(d.Ts, 10, 64)
+			bidPrice := o.parseFloat(d.BidPx, "ws.ticker.bidPx")
+			askPrice := o.parseFloat(d.AskPx, "ws.ticker.askPx")
+			lastPrice := o.parseFloat(d.Last, "ws.ticker.last")
+			ts := o.parseInt64(d.Ts, "ws.ticker.ts")
 
 			callback(&Ticker{
 				Symbol:    symbol,
@@ -588,6 +621,8 @@ func (o *OKX) SubscribePositions(callback func(*Position)) error {
 	o.positionCallback = callback
 	o.callbackMu.Unlock()
 
+	// Защита от race condition при инициализации WebSocket manager
+	o.wsMu.Lock()
 	if o.wsPrivateManager == nil {
 		config := DefaultWSReconnectConfig()
 		o.wsPrivateManager = NewWSReconnectManager("okx-private", okxWSPrivate, config)
@@ -604,9 +639,12 @@ func (o *OKX) SubscribePositions(callback func(*Position)) error {
 		})
 
 		if err := o.wsPrivateManager.Connect(); err != nil {
+			o.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to private WebSocket: %w", err)
 		}
 	}
+	wsManager := o.wsPrivateManager
+	o.wsMu.Unlock()
 
 	subMsg := map[string]interface{}{
 		"op": "subscribe",
@@ -618,8 +656,8 @@ func (o *OKX) SubscribePositions(callback func(*Position)) error {
 		},
 	}
 
-	o.wsPrivateManager.AddSubscription(subMsg)
-	return o.wsPrivateManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 func (o *OKX) authenticateWebSocket(conn *websocket.Conn) error {
@@ -694,12 +732,12 @@ func (o *OKX) handlePrivateMessage(message []byte) {
 
 		if callback != nil {
 			for _, p := range msg.Data {
-				pos, _ := strconv.ParseFloat(p.Pos, 64)
-				entryPrice, _ := strconv.ParseFloat(p.AvgPx, 64)
-				markPrice, _ := strconv.ParseFloat(p.MarkPx, 64)
-				leverage, _ := strconv.Atoi(p.Lever)
-				unrealizedPnl, _ := strconv.ParseFloat(p.Upl, 64)
-				uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
+				pos := o.parseFloat(p.Pos, "ws.position.pos")
+				entryPrice := o.parseFloat(p.AvgPx, "ws.position.avgPx")
+				markPrice := o.parseFloat(p.MarkPx, "ws.position.markPx")
+				leverage := o.parseInt(p.Lever, "ws.position.lever")
+				unrealizedPnl := o.parseFloat(p.Upl, "ws.position.upl")
+				uTime := o.parseInt64(p.UTime, "ws.position.uTime")
 
 				side := SideLong
 				if p.PosSide == "short" {
@@ -763,11 +801,11 @@ func (o *OKX) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 	}
 
 	info := resp.Data[0]
-	minOrderQty, _ := strconv.ParseFloat(info.MinSz, 64)
-	maxOrderQty, _ := strconv.ParseFloat(info.MaxLmtSz, 64)
-	qtyStep, _ := strconv.ParseFloat(info.LotSz, 64)
-	priceStep, _ := strconv.ParseFloat(info.TickSz, 64)
-	maxLeverage, _ := strconv.Atoi(info.Lever)
+	minOrderQty := o.parseFloat(info.MinSz, "limits.minSz")
+	maxOrderQty := o.parseFloat(info.MaxLmtSz, "limits.maxLmtSz")
+	qtyStep := o.parseFloat(info.LotSz, "limits.lotSz")
+	priceStep := o.parseFloat(info.TickSz, "limits.tickSz")
+	maxLeverage := o.parseInt(info.Lever, "limits.lever")
 
 	return &Limits{
 		Symbol:      symbol,
