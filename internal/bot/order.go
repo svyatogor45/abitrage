@@ -104,6 +104,7 @@ func NewOrderExecutor(exchanges map[string]exchange.Exchange, cfg config.BotConf
 // - БЕЗ параллелизма было бы: latency_A + latency_B ≈ 300-600ms
 //
 // ОПТИМИЗАЦИЯ: использует sync.Pool для каналов - без аллокаций на каждый ордер
+// FIX: безопасное освобождение каналов в пул после завершения горутин
 func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecuteParams) *ExecuteResult {
 	oe.mu.RLock()
 	longExch, longOk := oe.exchanges[params.LongExchange]
@@ -119,10 +120,9 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 	}
 
 	// ОПТИМИЗАЦИЯ: каналы из пула (без аллокации!)
+	// НЕ используем defer - возвращаем вручную после завершения горутин
 	longCh := acquireLegResultChan()
 	shortCh := acquireLegResultChan()
-	defer releaseLegResultChan(longCh)
-	defer releaseLegResultChan(shortCh)
 
 	// Объём для одной части (если разбиваем на N ордеров)
 	partVolume := params.Volume
@@ -130,20 +130,31 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 		partVolume = params.Volume / float64(params.NOrders)
 	}
 
+	// WaitGroup для отслеживания завершения горутин (FIX race condition)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
 	// ПАРАЛЛЕЛЬНАЯ отправка ордеров
 	go func() {
+		defer wg.Done()
 		order, err := longExch.PlaceMarketOrder(ctx, params.Symbol, exchange.SideBuy, partVolume)
-		longCh <- LegResult{Order: order, Error: err}
+		// Безопасная запись - если канал переполнен, не блокируемся
+		select {
+		case longCh <- LegResult{Order: order, Error: err}:
+		default:
+		}
 	}()
 
 	go func() {
+		defer wg.Done()
 		order, err := shortExch.PlaceMarketOrder(ctx, params.Symbol, exchange.SideSell, partVolume)
-		shortCh <- LegResult{Order: order, Error: err}
+		select {
+		case shortCh <- LegResult{Order: order, Error: err}:
+		default:
+		}
 	}()
 
 	// ОПТИМИЗАЦИЯ: параллельное ожидание обоих результатов
-	// Было: ждём long → потом ждём short (если long медленный, не слушаем short)
-	// Стало: слушаем оба канала одновременно
 	var longResult, shortResult LegResult
 	var longReceived, shortReceived bool
 
@@ -154,19 +165,26 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 		case shortResult = <-shortCh:
 			shortReceived = true
 		case <-ctx.Done():
-			// Timeout - откатываем то, что успело исполниться
+			// Timeout - асинхронно ждём завершения горутин и возвращаем каналы в пул
+			go func() {
+				wg.Wait()
+				releaseLegResultChan(longCh)
+				releaseLegResultChan(shortCh)
+			}()
+
+			// Откатываем то, что успело исполниться
 			var rollbackErrors []error
-			if longReceived && longResult.Error == nil {
-				if err := oe.rollbackLong(params.Symbol, longExch, longResult.Order); err != nil {
+			if longReceived && longResult.Error == nil && longResult.Order != nil {
+				if err := oe.rollbackLongWithCtx(context.Background(), params.Symbol, longExch, longResult.Order); err != nil {
 					rollbackErrors = append(rollbackErrors, err)
 				}
 			}
-			if shortReceived && shortResult.Error == nil {
-				if err := oe.rollbackShort(params.Symbol, shortExch, shortResult.Order); err != nil {
+			if shortReceived && shortResult.Error == nil && shortResult.Order != nil {
+				if err := oe.rollbackShortWithCtx(context.Background(), params.Symbol, shortExch, shortResult.Order); err != nil {
 					rollbackErrors = append(rollbackErrors, err)
 				}
 			}
-			// Включаем ошибки отката в итоговую ошибку
+
 			if len(rollbackErrors) > 0 {
 				return &ExecuteResult{
 					Success: false,
@@ -176,6 +194,10 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 			return &ExecuteResult{Success: false, Error: ctx.Err()}
 		}
 	}
+
+	// Happy path: синхронно возвращаем каналы в пул (горутины уже завершились)
+	releaseLegResultChan(longCh)
+	releaseLegResultChan(shortCh)
 
 	// Обработка результатов
 	return oe.handleResults(ctx, params, longExch, shortExch, longResult, shortResult)
@@ -249,41 +271,47 @@ func (oe *OrderExecutor) handleResults(
 	}
 }
 
-// rollbackLong закрывает лонг при ошибке шорта
-// Возвращает ошибку если откат не удался (для логирования)
+// rollbackLong закрывает лонг при ошибке шорта (использует внутренний таймаут)
 func (oe *OrderExecutor) rollbackLong(symbol string, exch exchange.Exchange, order *exchange.Order) error {
+	return oe.rollbackLongWithCtx(context.Background(), symbol, exch, order)
+}
+
+// rollbackLongWithCtx закрывает лонг с указанным родительским контекстом
+// Использует отдельный таймаут для операции отката
+func (oe *OrderExecutor) rollbackLongWithCtx(parentCtx context.Context, symbol string, exch exchange.Exchange, order *exchange.Order) error {
 	if order == nil || order.FilledQty == 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), oe.cfg.OrderTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, oe.cfg.OrderTimeout)
 	defer cancel()
 
 	// Продаём то, что купили
 	_, err := exch.PlaceMarketOrder(ctx, symbol, exchange.SideSell, order.FilledQty)
 	if err != nil {
-		// Логируем критическую ошибку - позиция осталась открытой!
-		// TODO: добавить алерт через notification channel
 		return fmt.Errorf("CRITICAL: failed to rollback long on %s: %w", exch.GetName(), err)
 	}
 	return nil
 }
 
-// rollbackShort закрывает шорт при ошибке лонга
-// Возвращает ошибку если откат не удался (для логирования)
+// rollbackShort закрывает шорт при ошибке лонга (использует внутренний таймаут)
 func (oe *OrderExecutor) rollbackShort(symbol string, exch exchange.Exchange, order *exchange.Order) error {
+	return oe.rollbackShortWithCtx(context.Background(), symbol, exch, order)
+}
+
+// rollbackShortWithCtx закрывает шорт с указанным родительским контекстом
+// Использует отдельный таймаут для операции отката
+func (oe *OrderExecutor) rollbackShortWithCtx(parentCtx context.Context, symbol string, exch exchange.Exchange, order *exchange.Order) error {
 	if order == nil || order.FilledQty == 0 {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), oe.cfg.OrderTimeout)
+	ctx, cancel := context.WithTimeout(parentCtx, oe.cfg.OrderTimeout)
 	defer cancel()
 
 	// Покупаем то, что продали
 	_, err := exch.PlaceMarketOrder(ctx, symbol, exchange.SideBuy, order.FilledQty)
 	if err != nil {
-		// Логируем критическую ошибку - позиция осталась открытой!
-		// TODO: добавить алерт через notification channel
 		return fmt.Errorf("CRITICAL: failed to rollback short on %s: %w", exch.GetName(), err)
 	}
 	return nil
@@ -358,6 +386,7 @@ func (oe *OrderExecutor) closeSingleLeg(ctx context.Context, symbol string, leg 
 }
 
 // closeTwoLegs закрывает обе ноги параллельно
+// FIX: безопасное освобождение каналов в пул после завершения горутин
 func (oe *OrderExecutor) closeTwoLegs(ctx context.Context, symbol string, legs []models.Leg) *ExecuteResult {
 	oe.mu.RLock()
 	exch1, ok1 := oe.exchanges[legs[0].Exchange]
@@ -369,35 +398,44 @@ func (oe *OrderExecutor) closeTwoLegs(ctx context.Context, symbol string, legs [
 	}
 
 	// ОПТИМИЗАЦИЯ: каналы из пула (без аллокации!)
+	// НЕ используем defer - возвращаем вручную после завершения горутин
 	ch1 := acquireLegResultChan()
 	ch2 := acquireLegResultChan()
-	defer releaseLegResultChan(ch1)
-	defer releaseLegResultChan(ch2)
+
+	// WaitGroup для отслеживания завершения горутин (FIX race condition)
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Предвычисляем стороны закрытия (избегаем вычислений в горутинах)
+	side1 := exchange.SideSell
+	if legs[0].Side != "long" {
+		side1 = exchange.SideBuy
+	}
+	side2 := exchange.SideSell
+	if legs[1].Side != "long" {
+		side2 = exchange.SideBuy
+	}
 
 	// Параллельное закрытие
 	go func() {
-		var side string
-		if legs[0].Side == "long" {
-			side = exchange.SideSell // закрываем лонг продажей
-		} else {
-			side = exchange.SideBuy // закрываем шорт покупкой
+		defer wg.Done()
+		order, err := exch1.PlaceMarketOrder(ctx, symbol, side1, legs[0].Quantity)
+		select {
+		case ch1 <- LegResult{Order: order, Error: err}:
+		default:
 		}
-		order, err := exch1.PlaceMarketOrder(ctx, symbol, side, legs[0].Quantity)
-		ch1 <- LegResult{Order: order, Error: err}
 	}()
 
 	go func() {
-		var side string
-		if legs[1].Side == "long" {
-			side = exchange.SideSell
-		} else {
-			side = exchange.SideBuy
+		defer wg.Done()
+		order, err := exch2.PlaceMarketOrder(ctx, symbol, side2, legs[1].Quantity)
+		select {
+		case ch2 <- LegResult{Order: order, Error: err}:
+		default:
 		}
-		order, err := exch2.PlaceMarketOrder(ctx, symbol, side, legs[1].Quantity)
-		ch2 <- LegResult{Order: order, Error: err}
 	}()
 
-	// ОПТИМИЗАЦИЯ: параллельное ожидание обоих результатов
+	// Параллельное ожидание обоих результатов
 	var res1, res2 LegResult
 	var res1Received, res2Received bool
 
@@ -408,9 +446,19 @@ func (oe *OrderExecutor) closeTwoLegs(ctx context.Context, symbol string, legs [
 		case res2 = <-ch2:
 			res2Received = true
 		case <-ctx.Done():
+			// Timeout - асинхронно ждём завершения горутин и возвращаем каналы в пул
+			go func() {
+				wg.Wait()
+				releaseLegResultChan(ch1)
+				releaseLegResultChan(ch2)
+			}()
 			return &ExecuteResult{Success: false, Error: ctx.Err()}
 		}
 	}
+
+	// Happy path: синхронно возвращаем каналы в пул
+	releaseLegResultChan(ch1)
+	releaseLegResultChan(ch2)
 
 	// Проверяем результаты
 	if res1.Error != nil || res2.Error != nil {
@@ -420,25 +468,22 @@ func (oe *OrderExecutor) closeTwoLegs(ctx context.Context, symbol string, legs [
 		}
 	}
 
-	// Рассчитываем PNL для каждой ноги
+	// Рассчитываем PNL для каждой ноги (оптимизировано - без лишних проверок)
 	var totalPnl float64
-	for i, leg := range legs {
-		var result LegResult
-		if i == 0 {
-			result = res1
+	if res1.Order != nil {
+		closePrice := res1.Order.AvgFillPrice
+		if legs[0].Side == "long" {
+			totalPnl += (closePrice - legs[0].EntryPrice) * legs[0].Quantity
 		} else {
-			result = res2
+			totalPnl += (legs[0].EntryPrice - closePrice) * legs[0].Quantity
 		}
-
-		if result.Order != nil {
-			closePrice := result.Order.AvgFillPrice
-			if leg.Side == "long" {
-				// Long: PNL = (цена закрытия - цена входа) * количество
-				totalPnl += (closePrice - leg.EntryPrice) * leg.Quantity
-			} else {
-				// Short: PNL = (цена входа - цена закрытия) * количество
-				totalPnl += (leg.EntryPrice - closePrice) * leg.Quantity
-			}
+	}
+	if res2.Order != nil {
+		closePrice := res2.Order.AvgFillPrice
+		if legs[1].Side == "long" {
+			totalPnl += (closePrice - legs[1].EntryPrice) * legs[1].Quantity
+		} else {
+			totalPnl += (legs[1].EntryPrice - closePrice) * legs[1].Quantity
 		}
 	}
 
