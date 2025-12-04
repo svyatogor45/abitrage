@@ -126,6 +126,8 @@ func (h *BlacklistHandler) GetBlacklist(w http.ResponseWriter, r *http.Request) 
 //
 //	{"error": "internal server error"}
 func (h *BlacklistHandler) AddToBlacklist(w http.ResponseWriter, r *http.Request) {
+	// Ограничиваем размер тела запроса
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
 	var req addToBlacklistRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, "Invalid request body")
@@ -211,10 +213,10 @@ func (h *BlacklistHandler) RemoveFromBlacklist(w http.ResponseWriter, r *http.Re
 func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+	_ = json.NewEncoder(w).Encode(data)
 }
 
 // respondError отправляет JSON ответ с ошибкой
 func respondError(w http.ResponseWriter, status int, message string) {
-	respondJSON(w, status, map[string]string{"error": message})
+	respondJSON(w, status, ErrorResponse{Error: message})
 }
