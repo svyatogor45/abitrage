@@ -307,20 +307,20 @@ func TestIsActive_UnknownState(t *testing.T) {
 	}
 }
 
-// TestHasOpenPosition проверяет определение состояний с открытой позицией
+// TestHasOpenPosition проверяет определение состояний с открытой позицией или ордерами в процессе
 func TestHasOpenPosition(t *testing.T) {
 	tests := []struct {
 		state string
 		want  bool
 	}{
-		// Состояния с открытой позицией
+		// Состояния с открытой позицией или ордерами в процессе
 		{state: models.StateHolding, want: true},
 		{state: models.StateExiting, want: true},
+		{state: models.StateEntering, want: true}, // ордера отправлены, есть exposure
 
 		// Состояния без открытой позиции
 		{state: models.StatePaused, want: false},
 		{state: models.StateReady, want: false},
-		{state: models.StateEntering, want: false}, // позиция ещё не полностью открыта
 		{state: models.StateError, want: false},
 	}
 
@@ -329,6 +329,33 @@ func TestHasOpenPosition(t *testing.T) {
 			got := HasOpenPosition(tt.state)
 			if got != tt.want {
 				t.Errorf("HasOpenPosition(%s) = %v, want %v", tt.state, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHasFilledPosition проверяет определение состояний с полностью исполненной позицией
+func TestHasFilledPosition(t *testing.T) {
+	tests := []struct {
+		state string
+		want  bool
+	}{
+		// Состояния с исполненной позицией
+		{state: models.StateHolding, want: true},
+		{state: models.StateExiting, want: true},
+
+		// Состояния без исполненной позиции
+		{state: models.StatePaused, want: false},
+		{state: models.StateReady, want: false},
+		{state: models.StateEntering, want: false}, // ордера ещё исполняются
+		{state: models.StateError, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			got := HasFilledPosition(tt.state)
+			if got != tt.want {
+				t.Errorf("HasFilledPosition(%s) = %v, want %v", tt.state, got, tt.want)
 			}
 		})
 	}
@@ -365,15 +392,17 @@ func TestValidTransitions_Completeness(t *testing.T) {
 		models.StateError,
 	}
 
-	// Проверяем, что все состояния есть в ValidTransitions
+	transitions := GetValidTransitions()
+
+	// Проверяем, что все состояния есть в validTransitions
 	for _, state := range allStates {
-		if _, ok := ValidTransitions[state]; !ok {
-			t.Errorf("State %s is not defined in ValidTransitions", state)
+		if _, ok := transitions[state]; !ok {
+			t.Errorf("State %s is not defined in validTransitions", state)
 		}
 	}
 
-	// Проверяем, что нет лишних состояний в ValidTransitions
-	for state := range ValidTransitions {
+	// Проверяем, что нет лишних состояний в validTransitions
+	for state := range transitions {
 		found := false
 		for _, s := range allStates {
 			if s == state {
@@ -382,14 +411,14 @@ func TestValidTransitions_Completeness(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("Unknown state %s in ValidTransitions", state)
+			t.Errorf("Unknown state %s in validTransitions", state)
 		}
 	}
 }
 
 // TestValidTransitions_NoSelfLoops проверяет отсутствие переходов в себя
 func TestValidTransitions_NoSelfLoops(t *testing.T) {
-	for from, tos := range ValidTransitions {
+	for from, tos := range GetValidTransitions() {
 		for _, to := range tos {
 			if from == to {
 				t.Errorf("Self-loop detected: %s → %s", from, to)
@@ -409,7 +438,7 @@ func TestValidTransitions_AllTargetsAreValid(t *testing.T) {
 		models.StateError:    true,
 	}
 
-	for from, tos := range ValidTransitions {
+	for from, tos := range GetValidTransitions() {
 		for _, to := range tos {
 			if !allStates[to] {
 				t.Errorf("Invalid target state %s in transition from %s", to, from)

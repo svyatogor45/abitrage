@@ -6,8 +6,9 @@ import (
 	"sync"
 )
 
-// ValidTransitions определяет допустимые переходы между состояниями (для совместимости и тестов)
-var ValidTransitions = map[string][]string{
+// validTransitions определяет допустимые переходы между состояниями
+// Не экспортируется для защиты от внешней модификации
+var validTransitions = map[string][]string{
 	models.StatePaused:   {models.StateReady},
 	models.StateReady:    {models.StatePaused, models.StateEntering},
 	models.StateEntering: {models.StateHolding, models.StateReady, models.StateError}, // Ready при откате
@@ -19,8 +20,8 @@ var ValidTransitions = map[string][]string{
 // validTransitionsSet - O(1) lookup версия для hot path
 // Инициализируется один раз при загрузке пакета
 var validTransitionsSet = func() map[string]map[string]struct{} {
-	result := make(map[string]map[string]struct{}, len(ValidTransitions))
-	for from, toList := range ValidTransitions {
+	result := make(map[string]map[string]struct{}, len(validTransitions))
+	for from, toList := range validTransitions {
 		result[from] = make(map[string]struct{}, len(toList))
 		for _, to := range toList {
 			result[from][to] = struct{}{}
@@ -28,6 +29,15 @@ var validTransitionsSet = func() map[string]map[string]struct{} {
 	}
 	return result
 }()
+
+// GetValidTransitions возвращает копию допустимых переходов (для тестов и отладки)
+func GetValidTransitions() map[string][]string {
+	result := make(map[string][]string, len(validTransitions))
+	for k, v := range validTransitions {
+		result[k] = append([]string{}, v...) // deep copy слайса
+	}
+	return result
+}
 
 // CanTransition проверяет допустимость перехода - O(1) lookup
 func CanTransition(from, to string) bool {
@@ -50,17 +60,23 @@ func (e *StateTransitionError) Error() string {
 }
 
 // TryTransition атомарно проверяет и выполняет переход состояния
-// Возвращает true если переход выполнен, false если невалиден
+// Возвращает nil если переход выполнен, error если невалиден
 // ВАЖНО: вызывающий код должен держать lock на PairState.mu
 func TryTransition(runtime *models.PairRuntime, pairID int, newState string) error {
-	if !CanTransition(runtime.State, newState) {
+	if runtime == nil {
+		return fmt.Errorf("runtime is nil for pair %d", pairID)
+	}
+	oldState := runtime.State
+	if !CanTransition(oldState, newState) {
 		return &StateTransitionError{
 			PairID: pairID,
-			From:   runtime.State,
+			From:   oldState,
 			To:     newState,
 		}
 	}
 	runtime.State = newState
+	// Записываем метрику перехода (async-safe, использует свой lock)
+	RecordTransition(oldState, newState)
 	return nil
 }
 
@@ -77,7 +93,8 @@ var (
 	transitionCounterLock sync.RWMutex
 )
 
-// RecordTransition записывает переход для метрик (вызывается автоматически в TryTransition)
+// RecordTransition записывает переход для метрик
+// Вызывается автоматически в TryTransition, можно вызвать вручную для ForceTransition
 func RecordTransition(from, to string) {
 	key := from + "→" + to
 	transitionCounterLock.Lock()
@@ -121,7 +138,15 @@ func IsActive(s string) bool {
 	return s == models.StateReady || s == models.StateEntering || s == models.StateHolding || s == models.StateExiting
 }
 
-// HasOpenPosition возвращает true если есть открытая позиция
+// HasOpenPosition возвращает true если есть открытая позиция или ордера в процессе исполнения
+// Включает ENTERING т.к. ордера уже отправлены и есть exposure
+// Консистентно с Engine.HasOpenPosition
 func HasOpenPosition(s string) bool {
+	return s == models.StateHolding || s == models.StateEntering || s == models.StateExiting
+}
+
+// HasFilledPosition возвращает true если позиция полностью исполнена
+// Не включает ENTERING - только HOLDING (позиция открыта) и EXITING (закрывается)
+func HasFilledPosition(s string) bool {
 	return s == models.StateHolding || s == models.StateExiting
 }
