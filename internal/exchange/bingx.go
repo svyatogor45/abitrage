@@ -31,6 +31,7 @@ type BingX struct {
 
 	// WebSocket manager с автоматическим переподключением
 	wsManager *WSReconnectManager
+	wsMu      sync.Mutex // защита инициализации WebSocket manager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -38,6 +39,15 @@ type BingX struct {
 
 	connected bool
 	closeChan chan struct{}
+}
+
+// parseFloat парсит строку в float64 с логированием ошибок
+func (b *BingX) parseFloat(value, field string) float64 {
+	result, err := strconv.ParseFloat(value, 64)
+	if err != nil && value != "" {
+		log.Printf("[bingx] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
 }
 
 // NewBingX создаёт новый экземпляр BingX
@@ -162,7 +172,7 @@ func (b *BingX) GetBalance(ctx context.Context) (float64, error) {
 		return 0, err
 	}
 
-	equity, _ := strconv.ParseFloat(resp.Data.Balance.Equity, 64)
+	equity := b.parseFloat(resp.Data.Balance.Equity, "equity")
 	return equity, nil
 }
 
@@ -191,9 +201,9 @@ func (b *BingX) GetTicker(ctx context.Context, symbol string) (*Ticker, error) {
 		return nil, err
 	}
 
-	bidPrice, _ := strconv.ParseFloat(resp.Data.BidPrice, 64)
-	askPrice, _ := strconv.ParseFloat(resp.Data.AskPrice, 64)
-	lastPrice, _ := strconv.ParseFloat(resp.Data.LastPrice, 64)
+	bidPrice := b.parseFloat(resp.Data.BidPrice, "bidPrice")
+	askPrice := b.parseFloat(resp.Data.AskPrice, "askPrice")
+	lastPrice := b.parseFloat(resp.Data.LastPrice, "lastPrice")
 
 	return &Ticker{
 		Symbol:    symbol,
@@ -242,16 +252,16 @@ func (b *BingX) GetOrderBook(ctx context.Context, symbol string, depth int) (*Or
 
 	for i, bid := range resp.Data.Bids {
 		if len(bid) >= 2 {
-			price, _ := strconv.ParseFloat(bid[0], 64)
-			volume, _ := strconv.ParseFloat(bid[1], 64)
+			price := b.parseFloat(bid[0], "bid_price")
+			volume := b.parseFloat(bid[1], "bid_volume")
 			orderBook.Bids[i] = PriceLevel{Price: price, Volume: volume}
 		}
 	}
 
 	for i, ask := range resp.Data.Asks {
 		if len(ask) >= 2 {
-			price, _ := strconv.ParseFloat(ask[0], 64)
-			volume, _ := strconv.ParseFloat(ask[1], 64)
+			price := b.parseFloat(ask[0], "ask_price")
+			volume := b.parseFloat(ask[1], "ask_volume")
 			orderBook.Asks[i] = PriceLevel{Price: price, Volume: volume}
 		}
 	}
@@ -306,8 +316,8 @@ func (b *BingX) PlaceMarketOrder(ctx context.Context, symbol, side string, qty f
 		return nil, err
 	}
 
-	filledQty, _ := strconv.ParseFloat(resp.Data.Order.ExecutedQty, 64)
-	avgPrice, _ := strconv.ParseFloat(resp.Data.Order.AvgPrice, 64)
+	filledQty := b.parseFloat(resp.Data.Order.ExecutedQty, "executedQty")
+	avgPrice := b.parseFloat(resp.Data.Order.AvgPrice, "avgPrice")
 
 	return &Order{
 		ID:           resp.Data.Order.OrderId,
@@ -349,14 +359,14 @@ func (b *BingX) GetOpenPositions(ctx context.Context) ([]*Position, error) {
 
 	positions := make([]*Position, 0)
 	for _, p := range resp.Data {
-		posAmt, _ := strconv.ParseFloat(p.PositionAmt, 64)
+		posAmt := b.parseFloat(p.PositionAmt, "positionAmt")
 		if posAmt == 0 {
 			continue
 		}
 
-		entryPrice, _ := strconv.ParseFloat(p.AvgPrice, 64)
-		markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-		unrealizedPnl, _ := strconv.ParseFloat(p.UnrealizedProfit, 64)
+		entryPrice := b.parseFloat(p.AvgPrice, "avgPrice")
+		markPrice := b.parseFloat(p.MarkPrice, "markPrice")
+		unrealizedPnl := b.parseFloat(p.UnrealizedProfit, "unrealizedProfit")
 
 		side := SideLong
 		size := posAmt
@@ -410,6 +420,7 @@ func (b *BingX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	b.tickerCallbacks[symbol] = callback
 	b.callbackMu.Unlock()
 
+	b.wsMu.Lock()
 	if b.wsManager == nil {
 		config := DefaultWSReconnectConfig()
 		b.wsManager = NewWSReconnectManager("bingx", bingxWSURL, config)
@@ -425,9 +436,12 @@ func (b *BingX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		})
 
 		if err := b.wsManager.Connect(); err != nil {
+			b.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := b.wsManager
+	b.wsMu.Unlock()
 
 	bingxSymbol := b.toBingXSymbol(symbol)
 	subMsg := map[string]interface{}{
@@ -436,8 +450,8 @@ func (b *BingX) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		"dataType": fmt.Sprintf("%s@ticker", bingxSymbol),
 	}
 
-	b.wsManager.AddSubscription(subMsg)
-	return b.wsManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 // handleMessage обрабатывает одно сообщение из WebSocket
@@ -464,9 +478,9 @@ func (b *BingX) handleMessage(message []byte) {
 		b.callbackMu.RUnlock()
 
 		if ok && callback != nil {
-			bidPrice, _ := strconv.ParseFloat(msg.Data.BidPrice, 64)
-			askPrice, _ := strconv.ParseFloat(msg.Data.AskPrice, 64)
-			lastPrice, _ := strconv.ParseFloat(msg.Data.LastPrice, 64)
+			bidPrice := b.parseFloat(msg.Data.BidPrice, "ws_bidPrice")
+			askPrice := b.parseFloat(msg.Data.AskPrice, "ws_askPrice")
+			lastPrice := b.parseFloat(msg.Data.LastPrice, "ws_lastPrice")
 
 			callback(&Ticker{
 				Symbol:    symbol,
@@ -522,8 +536,8 @@ func (b *BingX) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 	}
 
 	info := resp.Data[0]
-	minSize, _ := strconv.ParseFloat(info.Size, 64)
-	tickSize, _ := strconv.ParseFloat(info.TickSize, 64)
+	minSize := b.parseFloat(info.Size, "size")
+	tickSize := b.parseFloat(info.TickSize, "tickSize")
 
 	return &Limits{
 		Symbol:      symbol,
@@ -543,10 +557,12 @@ func (b *BingX) Close() error {
 		close(b.closeChan)
 	}
 
+	b.wsMu.Lock()
 	if b.wsManager != nil {
 		b.wsManager.Close()
 		b.wsManager = nil
 	}
+	b.wsMu.Unlock()
 
 	b.connected = false
 	return nil
