@@ -37,6 +37,7 @@ type Bitget struct {
 	// WebSocket managers с автоматическим переподключением
 	wsPublicManager  *WSReconnectManager
 	wsPrivateManager *WSReconnectManager
+	wsMu             sync.Mutex // защита инициализации WebSocket managers
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -62,6 +63,33 @@ func (b *Bitget) sign(timestamp, method, requestPath, body string) string {
 	h := hmac.New(sha256.New, []byte(b.secretKey))
 	h.Write([]byte(message))
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// parseFloat парсит строку в float64 с логированием ошибок
+func (b *Bitget) parseFloat(value, field string) float64 {
+	result, err := strconv.ParseFloat(value, 64)
+	if err != nil && value != "" {
+		log.Printf("[bitget] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
+// parseInt парсит строку в int с логированием ошибок
+func (b *Bitget) parseInt(value, field string) int {
+	result, err := strconv.Atoi(value)
+	if err != nil && value != "" {
+		log.Printf("[bitget] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
+}
+
+// parseInt64 парсит строку в int64 с логированием ошибок
+func (b *Bitget) parseInt64(value, field string) int64 {
+	result, err := strconv.ParseInt(value, 10, 64)
+	if err != nil && value != "" {
+		log.Printf("[bitget] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
 }
 
 func (b *Bitget) doRequest(ctx context.Context, method, endpoint string, params map[string]string, signed bool) ([]byte, error) {
@@ -188,7 +216,7 @@ func (b *Bitget) GetBalance(ctx context.Context) (float64, error) {
 
 	for _, acc := range resp.Data {
 		if acc.MarginCoin == "USDT" {
-			equity, _ := strconv.ParseFloat(acc.AccountEquity, 64)
+			equity := b.parseFloat(acc.AccountEquity, "accountEquity")
 			return equity, nil
 		}
 	}
@@ -226,10 +254,10 @@ func (b *Bitget) GetTicker(ctx context.Context, symbol string) (*Ticker, error) 
 	}
 
 	t := resp.Data[0]
-	bidPrice, _ := strconv.ParseFloat(t.BidPr, 64)
-	askPrice, _ := strconv.ParseFloat(t.AskPr, 64)
-	lastPrice, _ := strconv.ParseFloat(t.LastPr, 64)
-	ts, _ := strconv.ParseInt(t.Timestamp, 10, 64)
+	bidPrice := b.parseFloat(t.BidPr, "bidPr")
+	askPrice := b.parseFloat(t.AskPr, "askPr")
+	lastPrice := b.parseFloat(t.LastPr, "lastPr")
+	ts := b.parseInt64(t.Timestamp, "timestamp")
 
 	return &Ticker{
 		Symbol:    t.Symbol,
@@ -268,7 +296,7 @@ func (b *Bitget) GetOrderBook(ctx context.Context, symbol string, depth int) (*O
 		return nil, err
 	}
 
-	ts, _ := strconv.ParseInt(resp.Data.Ts, 10, 64)
+	ts := b.parseInt64(resp.Data.Ts, "orderbook.ts")
 	orderBook := &OrderBook{
 		Symbol:    symbol,
 		Bids:      make([]PriceLevel, len(resp.Data.Bids)),
@@ -277,14 +305,14 @@ func (b *Bitget) GetOrderBook(ctx context.Context, symbol string, depth int) (*O
 	}
 
 	for i, bid := range resp.Data.Bids {
-		price, _ := strconv.ParseFloat(bid[0], 64)
-		volume, _ := strconv.ParseFloat(bid[1], 64)
+		price := b.parseFloat(bid[0], "bid.price")
+		volume := b.parseFloat(bid[1], "bid.volume")
 		orderBook.Bids[i] = PriceLevel{Price: price, Volume: volume}
 	}
 
 	for i, ask := range resp.Data.Asks {
-		price, _ := strconv.ParseFloat(ask[0], 64)
-		volume, _ := strconv.ParseFloat(ask[1], 64)
+		price := b.parseFloat(ask[0], "ask.price")
+		volume := b.parseFloat(ask[1], "ask.volume")
 		orderBook.Asks[i] = PriceLevel{Price: price, Volume: volume}
 	}
 
@@ -380,8 +408,8 @@ func (b *Bitget) getOrderDetail(ctx context.Context, symbol, orderId string) (*s
 		return nil, err
 	}
 
-	filledQty, _ := strconv.ParseFloat(resp.Data.BaseVolume, 64)
-	avgPrice, _ := strconv.ParseFloat(resp.Data.PriceAvg, 64)
+	filledQty := b.parseFloat(resp.Data.BaseVolume, "baseVolume")
+	avgPrice := b.parseFloat(resp.Data.PriceAvg, "priceAvg")
 
 	return &struct {
 		FilledQty float64
@@ -423,16 +451,16 @@ func (b *Bitget) GetOpenPositions(ctx context.Context) ([]*Position, error) {
 
 	positions := make([]*Position, 0)
 	for _, p := range resp.Data {
-		size, _ := strconv.ParseFloat(p.Total, 64)
+		size := b.parseFloat(p.Total, "position.total")
 		if size == 0 {
 			continue
 		}
 
-		entryPrice, _ := strconv.ParseFloat(p.OpenPriceAvg, 64)
-		markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-		leverage, _ := strconv.Atoi(p.Leverage)
-		unrealizedPnl, _ := strconv.ParseFloat(p.UnrealizedPL, 64)
-		uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
+		entryPrice := b.parseFloat(p.OpenPriceAvg, "position.openPriceAvg")
+		markPrice := b.parseFloat(p.MarkPrice, "position.markPrice")
+		leverage := b.parseInt(p.Leverage, "position.leverage")
+		unrealizedPnl := b.parseFloat(p.UnrealizedPL, "position.unrealizedPL")
+		uTime := b.parseInt64(p.UTime, "position.uTime")
 
 		side := SideLong
 		if p.HoldSide == "short" {
@@ -481,7 +509,8 @@ func (b *Bitget) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	b.tickerCallbacks[symbol] = callback
 	b.callbackMu.Unlock()
 
-	// Создаём WSReconnectManager если ещё не создан
+	// Защита от race condition при инициализации WebSocket manager
+	b.wsMu.Lock()
 	if b.wsPublicManager == nil {
 		config := DefaultWSReconnectConfig()
 		b.wsPublicManager = NewWSReconnectManager("bitget-public", bitgetWSPublic, config)
@@ -497,9 +526,12 @@ func (b *Bitget) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		})
 
 		if err := b.wsPublicManager.Connect(); err != nil {
+			b.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := b.wsPublicManager
+	b.wsMu.Unlock()
 
 	subMsg := map[string]interface{}{
 		"op": "subscribe",
@@ -512,8 +544,8 @@ func (b *Bitget) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		},
 	}
 
-	b.wsPublicManager.AddSubscription(subMsg)
-	return b.wsPublicManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 // handlePublicMessage обрабатывает одно сообщение из публичного WebSocket
@@ -545,10 +577,10 @@ func (b *Bitget) handlePublicMessage(message []byte) {
 
 		if ok && callback != nil {
 			d := msg.Data[0]
-			bidPrice, _ := strconv.ParseFloat(d.BidPr, 64)
-			askPrice, _ := strconv.ParseFloat(d.AskPr, 64)
-			lastPrice, _ := strconv.ParseFloat(d.LastPr, 64)
-			ts, _ := strconv.ParseInt(d.Ts, 10, 64)
+			bidPrice := b.parseFloat(d.BidPr, "ws.ticker.bidPr")
+			askPrice := b.parseFloat(d.AskPr, "ws.ticker.askPr")
+			lastPrice := b.parseFloat(d.LastPr, "ws.ticker.lastPr")
+			ts := b.parseInt64(d.Ts, "ws.ticker.ts")
 
 			callback(&Ticker{
 				Symbol:    symbol,
@@ -566,7 +598,8 @@ func (b *Bitget) SubscribePositions(callback func(*Position)) error {
 	b.positionCallback = callback
 	b.callbackMu.Unlock()
 
-	// Создаём WSReconnectManager если ещё не создан
+	// Защита от race condition при инициализации WebSocket manager
+	b.wsMu.Lock()
 	if b.wsPrivateManager == nil {
 		config := DefaultWSReconnectConfig()
 		b.wsPrivateManager = NewWSReconnectManager("bitget-private", bitgetWSPrivate, config)
@@ -583,9 +616,12 @@ func (b *Bitget) SubscribePositions(callback func(*Position)) error {
 		})
 
 		if err := b.wsPrivateManager.Connect(); err != nil {
+			b.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to private WebSocket: %w", err)
 		}
 	}
+	wsManager := b.wsPrivateManager
+	b.wsMu.Unlock()
 
 	subMsg := map[string]interface{}{
 		"op": "subscribe",
@@ -598,8 +634,8 @@ func (b *Bitget) SubscribePositions(callback func(*Position)) error {
 		},
 	}
 
-	b.wsPrivateManager.AddSubscription(subMsg)
-	return b.wsPrivateManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 func (b *Bitget) authenticateWebSocket(conn *websocket.Conn) error {
@@ -675,12 +711,12 @@ func (b *Bitget) handlePrivateMessage(message []byte) {
 
 		if callback != nil {
 			for _, p := range msg.Data {
-				size, _ := strconv.ParseFloat(p.Total, 64)
-				entryPrice, _ := strconv.ParseFloat(p.OpenPriceAvg, 64)
-				markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-				leverage, _ := strconv.Atoi(p.Leverage)
-				unrealizedPnl, _ := strconv.ParseFloat(p.UnrealizedPL, 64)
-				uTime, _ := strconv.ParseInt(p.UTime, 10, 64)
+				size := b.parseFloat(p.Total, "ws.position.total")
+				entryPrice := b.parseFloat(p.OpenPriceAvg, "ws.position.openPriceAvg")
+				markPrice := b.parseFloat(p.MarkPrice, "ws.position.markPrice")
+				leverage := b.parseInt(p.Leverage, "ws.position.leverage")
+				unrealizedPnl := b.parseFloat(p.UnrealizedPL, "ws.position.unrealizedPL")
+				uTime := b.parseInt64(p.UTime, "ws.position.uTime")
 
 				side := SideLong
 				if p.HoldSide == "short" {
@@ -740,12 +776,12 @@ func (b *Bitget) GetLimits(ctx context.Context, symbol string) (*Limits, error) 
 	}
 
 	info := resp.Data[0]
-	minOrderQty, _ := strconv.ParseFloat(info.MinTradeNum, 64)
-	maxOrderQty, _ := strconv.ParseFloat(info.MaxPositionNum, 64)
-	sizeMultiplier, _ := strconv.ParseFloat(info.SizeMultiplier, 64)
-	pricePlace, _ := strconv.Atoi(info.PricePlace)
-	volPlace, _ := strconv.Atoi(info.VolPlace)
-	maxLeverage, _ := strconv.Atoi(info.MaxLever)
+	minOrderQty := b.parseFloat(info.MinTradeNum, "limits.minTradeNum")
+	maxOrderQty := b.parseFloat(info.MaxPositionNum, "limits.maxPositionNum")
+	sizeMultiplier := b.parseFloat(info.SizeMultiplier, "limits.sizeMultiplier")
+	pricePlace := b.parseInt(info.PricePlace, "limits.pricePlace")
+	volPlace := b.parseInt(info.VolPlace, "limits.volPlace")
+	maxLeverage := b.parseInt(info.MaxLever, "limits.maxLever")
 
 	qtyStep := 1.0
 	for i := 0; i < volPlace; i++ {
