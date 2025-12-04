@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,10 +122,11 @@ func (r *NotificationRepository) GetByTypes(types []string, limit int) ([]*model
 	}
 
 	// Создаем плейсхолдеры для IN clause
+	// Используем strconv.Itoa для корректной работы с любым количеством типов
 	placeholders := make([]string, len(types))
 	args := make([]interface{}, len(types)+1)
 	for i, t := range types {
-		placeholders[i] = "$" + string(rune('1'+i))
+		placeholders[i] = "$" + strconv.Itoa(i+1)
 		args[i] = t
 	}
 	args[len(types)] = limit
@@ -134,7 +136,7 @@ func (r *NotificationRepository) GetByTypes(types []string, limit int) ([]*model
 		FROM notifications
 		WHERE type IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY timestamp DESC
-		LIMIT $` + string(rune('1'+len(types)))
+		LIMIT $` + strconv.Itoa(len(types)+1)
 
 	rows, err := r.db.Query(query, args...)
 	if err != nil {
