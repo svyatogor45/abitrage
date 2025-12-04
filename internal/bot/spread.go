@@ -338,9 +338,9 @@ func (pt *PriceTracker) GetBestPrices(symbol string) *BestPrices {
 		return nil
 	}
 	// Создаём копию под lock'ом
-	copy := *bp
+	bpCopy := *bp
 	shard.mu.RUnlock()
-	return &copy
+	return &bpCopy
 }
 
 // GetExchangePrice возвращает КОПИЮ цены конкретной биржи
@@ -356,9 +356,9 @@ func (pt *PriceTracker) GetExchangePrice(symbol, exchange string) *ExchangePrice
 		return nil
 	}
 	// Создаём копию под lock'ом
-	copy := *ep
+	epCopy := *ep
 	shard.mu.RUnlock()
-	return &copy
+	return &epCopy
 }
 
 // ============================================================
@@ -878,16 +878,19 @@ func (sc *SpreadCalculator) GetRealSpread(
 	totalFees := 2 * (feeLong + feeShort) * 100
 	netSpread := adjustedSpread - totalFees
 
-	return &ArbitrageOpportunity{
-		Symbol:        symbol,
-		LongExchange:  best.BestAskExch,
-		LongPrice:     analysis.LongSimulation.AvgPrice, // VWAP вместо лучшей цены
-		ShortExchange: best.BestBidExch,
-		ShortPrice:    analysis.ShortSimulation.AvgPrice, // VWAP вместо лучшей цены
-		RawSpread:     adjustedSpread,                    // спред с учётом slippage
-		NetSpread:     netSpread,                         // минус комиссии
-		Timestamp:     best.BestAskTime,
-	}
+	// ОПТИМИЗАЦИЯ: используем sync.Pool (консистентно с GetBestOpportunity)
+	// ВАЖНО: вызывающий код ДОЛЖЕН вызвать ReleaseArbitrageOpportunity() после использования!
+	opp := acquireArbitrageOpportunity()
+	opp.Symbol = symbol
+	opp.LongExchange = best.BestAskExch
+	opp.LongPrice = analysis.LongSimulation.AvgPrice   // VWAP вместо лучшей цены
+	opp.ShortExchange = best.BestBidExch
+	opp.ShortPrice = analysis.ShortSimulation.AvgPrice // VWAP вместо лучшей цены
+	opp.RawSpread = adjustedSpread                     // спред с учётом slippage
+	opp.NetSpread = netSpread                          // минус комиссии
+	opp.Timestamp = best.BestAskTime
+
+	return opp
 }
 
 // ============================================================
