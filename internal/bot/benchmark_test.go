@@ -146,7 +146,7 @@ func BenchmarkPriceTrackerConcurrentHeavy(b *testing.B) {
 func BenchmarkArbitrageDetectorDetect(b *testing.B) {
 	tracker := NewPriceTracker(16)
 	calc := NewSpreadCalculator(tracker)
-	detector := NewArbitrageDetector(tracker, calc, nil)
+	detector := NewArbitrageDetector(tracker, calc, nil, nil)
 
 	calc.SetFee("binance", 0.0004)
 	calc.SetFee("okx", 0.0005)
@@ -168,7 +168,7 @@ func BenchmarkArbitrageDetectorDetect(b *testing.B) {
 func BenchmarkArbitrageDetectorCheckEntry(b *testing.B) {
 	tracker := NewPriceTracker(16)
 	calc := NewSpreadCalculator(tracker)
-	detector := NewArbitrageDetector(tracker, calc, nil)
+	detector := NewArbitrageDetector(tracker, calc, nil, nil)
 
 	calc.SetFee("binance", 0.0004)
 	calc.SetFee("okx", 0.0005)
@@ -269,7 +269,7 @@ func BenchmarkOrderExecutorLatency(b *testing.B) {
 func BenchmarkFullHotPathComplete(b *testing.B) {
 	tracker := NewPriceTracker(16)
 	calc := NewSpreadCalculator(tracker)
-	detector := NewArbitrageDetector(tracker, calc, nil)
+	detector := NewArbitrageDetector(tracker, calc, nil, nil)
 
 	calc.SetFee("binance", 0.0004)
 	calc.SetFee("okx", 0.0005)
@@ -325,7 +325,7 @@ func BenchmarkFullHotPathComplete(b *testing.B) {
 func BenchmarkFullHotPathConcurrentMulti(b *testing.B) {
 	tracker := NewPriceTracker(16)
 	calc := NewSpreadCalculator(tracker)
-	detector := NewArbitrageDetector(tracker, calc, nil)
+	detector := NewArbitrageDetector(tracker, calc, nil, nil)
 
 	calc.SetFee("binance", 0.0004)
 	calc.SetFee("okx", 0.0005)
