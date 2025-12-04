@@ -190,6 +190,24 @@ func (ad *ArbitrageDetector) CheckEntryConditions(
 	symbol := config.Symbol
 	volume := config.VolumeAsset
 
+	// 0. Быстрая проверка статуса пары и открытых позиций
+	if config.Status != models.PairStatusActive {
+		result.Reason = fmt.Sprintf("pair status is %s", config.Status)
+		return result
+	}
+
+	if runtime := ps.Runtime; runtime != nil {
+		if runtime.IsOpen() {
+			result.Reason = fmt.Sprintf("pair %s already has an open or pending position", symbol)
+			return result
+		}
+
+		if runtime.State == models.StatePaused || runtime.State == models.StateError {
+			result.Reason = fmt.Sprintf("pair state blocks entry: %s", runtime.State)
+			return result
+		}
+	}
+
 	// 1. Проверка лимита одновременных арбитражей
 	if maxArbitrages > 0 && currentArbitrages >= int64(maxArbitrages) {
 		result.Reason = "max concurrent arbitrages reached"
