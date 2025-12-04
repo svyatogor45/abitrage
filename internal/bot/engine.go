@@ -347,6 +347,17 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 		return exch.GetBalance(ctx)
 	}
 
+	balanceFetcher := func(ctx context.Context, exchangeName string) (float64, error) {
+		e.exchMu.RLock()
+		exch, ok := e.exchanges[exchangeName]
+		e.exchMu.RUnlock()
+		if !ok {
+			return 0, fmt.Errorf("exchange %s not found", exchangeName)
+		}
+
+		return exch.GetBalance(ctx)
+	}
+
 	// Инициализация арбитражного детектора
 	e.arbDetector = NewArbitrageDetector(
 		e.priceTracker,
