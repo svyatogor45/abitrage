@@ -334,6 +334,18 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 
 	// Инициализация анализатора стаканов (5 уровней, 5 секунд актуальности)
 	e.orderBookAnalyzer = NewOrderBookAnalyzer(5, 5*time.Second)
+	e.spreadCalc.AttachOrderBookAnalyzer(e.orderBookAnalyzer, 0)
+
+	balanceFetcher := func(ctx context.Context, exchangeName string) (float64, error) {
+		e.exchMu.RLock()
+		exch, ok := e.exchanges[exchangeName]
+		e.exchMu.RUnlock()
+		if !ok {
+			return 0, fmt.Errorf("exchange %s not found", exchangeName)
+		}
+
+		return exch.GetBalance(ctx)
+	}
 
 	balanceFetcher := func(ctx context.Context, exchangeName string) (float64, error) {
 		e.exchMu.RLock()
@@ -1474,6 +1486,7 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 	ps.setEntrySpread(cfg.EntrySpreadPct)
 	ps.setExitSpread(cfg.ExitSpreadPct)
 	ps.setStopLoss(cfg.StopLoss)
+	e.spreadCalc.SetDefaultVolume(cfg.Symbol, cfg.VolumeAsset)
 
 	// Добавляем в основной map под lock
 	e.pairsMu.Lock()
@@ -1747,6 +1760,7 @@ func (e *Engine) UpdatePairConfig(pairID int, cfg *models.PairConfig) {
 	ps.Config.VolumeAsset = cfg.VolumeAsset
 	ps.Config.NOrders = cfg.NOrders
 	ps.Config.StopLoss = cfg.StopLoss
+	e.spreadCalc.SetDefaultVolume(cfg.Symbol, cfg.VolumeAsset)
 
 	// ОПТИМИЗАЦИЯ: обновляем atomic копии для lock-free чтения в горячем пути
 	// Эти значения читаются в checkArbitrageOpportunity без блокировки

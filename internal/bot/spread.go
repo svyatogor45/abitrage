@@ -372,6 +372,16 @@ type SpreadCalculator struct {
 	// Кэш комиссий по биржам (загружается один раз)
 	fees   map[string]float64 // exchange -> taker fee (например 0.0005 = 0.05%)
 	feesMu sync.RWMutex
+
+	// Анализатор стаканов для расчёта VWAP/ликвидности (опционально)
+	orderBookAnalyzer *OrderBookAnalyzer
+
+	// Базовый объём для оценки ликвидности (по умолчанию объём пары)
+	defaultVolume float64
+
+	// Индивидуальные объёмы по символам
+	volumeMu        sync.RWMutex
+	volumesBySymbol map[string]float64
 }
 
 // ArbitrageOpportunity - найденная арбитражная возможность
@@ -397,9 +407,42 @@ type ArbitrageOpportunity struct {
 // NewSpreadCalculator создаёт калькулятор
 func NewSpreadCalculator(tracker *PriceTracker) *SpreadCalculator {
 	return &SpreadCalculator{
-		tracker: tracker,
-		fees:    make(map[string]float64),
+		tracker:         tracker,
+		fees:            make(map[string]float64),
+		volumesBySymbol: make(map[string]float64),
 	}
+}
+
+// AttachOrderBookAnalyzer подключает анализатор стаканов и задаёт базовый объём для VWAP
+func (sc *SpreadCalculator) AttachOrderBookAnalyzer(analyzer *OrderBookAnalyzer, defaultVolume float64) {
+	sc.orderBookAnalyzer = analyzer
+	if defaultVolume > 0 {
+		sc.defaultVolume = defaultVolume
+	}
+}
+
+// SetDefaultVolume задаёт базовый объём для конкретного символа (используется в VWAP-расчётах)
+func (sc *SpreadCalculator) SetDefaultVolume(symbol string, volume float64) {
+	if volume <= 0 || symbol == "" {
+		return
+	}
+
+	sc.volumeMu.Lock()
+	sc.volumesBySymbol[symbol] = volume
+	sc.volumeMu.Unlock()
+}
+
+// getVolumeForSymbol возвращает объём для VWAP-оценки ликвидности
+func (sc *SpreadCalculator) getVolumeForSymbol(symbol string) float64 {
+	sc.volumeMu.RLock()
+	volume := sc.volumesBySymbol[symbol]
+	sc.volumeMu.RUnlock()
+
+	if volume > 0 {
+		return volume
+	}
+
+	return sc.defaultVolume
 }
 
 // SetFee устанавливает комиссию для биржи
@@ -428,6 +471,21 @@ func (sc *SpreadCalculator) GetBestOpportunity(symbol string) *ArbitrageOpportun
 	// Проверяем что спред положительный
 	if best.RawSpread <= 0 {
 		return nil
+	}
+
+	// Если подключён анализатор стаканов и задан объём — рассчитываем VWAP/slippage 5 уровней
+	if sc.orderBookAnalyzer != nil {
+		volume := sc.getVolumeForSymbol(symbol)
+		if volume > 0 {
+			analysis := sc.orderBookAnalyzer.AnalyzeLiquidity(symbol, volume, best.BestAskExch, best.BestBidExch)
+			if analysis == nil || !analysis.IsLiquidityOK {
+				return nil
+			}
+
+			best.BestAsk = analysis.LongSimulation.AvgPrice
+			best.BestBid = analysis.ShortSimulation.AvgPrice
+			best.RawSpread = analysis.AdjustedSpread
+		}
 	}
 
 	// Рассчитываем чистый спред с учётом комиссий
