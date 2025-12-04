@@ -76,6 +76,7 @@ type ArbitrageDetector struct {
 	priceTracker      *PriceTracker
 	spreadCalc        *SpreadCalculator
 	orderBookAnalyzer *OrderBookAnalyzer
+	balanceFetcher    func(ctx context.Context, exchange string) (float64, error)
 
 	// Кэш маржинальных требований (обновляется периодически)
 	marginCache sync.Map // exchange -> float64 (available margin)
@@ -91,11 +92,13 @@ func NewArbitrageDetector(
 	priceTracker *PriceTracker,
 	spreadCalc *SpreadCalculator,
 	orderBookAnalyzer *OrderBookAnalyzer,
+	balanceFetcher func(ctx context.Context, exchange string) (float64, error),
 ) *ArbitrageDetector {
 	return &ArbitrageDetector{
 		priceTracker:      priceTracker,
 		spreadCalc:        spreadCalc,
 		orderBookAnalyzer: orderBookAnalyzer,
+		balanceFetcher:    balanceFetcher,
 	}
 }
 
@@ -147,10 +150,10 @@ type EntryConditions struct {
 	Reason   string // причина если нельзя войти
 
 	// Детали проверки
-	SpreadOK       bool
-	LiquidityOK    bool
-	MarginOK       bool
-	LimitsOK       bool
+	SpreadOK        bool
+	LiquidityOK     bool
+	MarginOK        bool
+	LimitsOK        bool
 	MaxArbitragesOK bool
 
 	// Данные возможности
@@ -302,14 +305,31 @@ func (ad *ArbitrageDetector) checkMarginRequirement(
 	notional := volume * price
 	requiredMargin := notional / 10 * 2 // на обеих биржах
 
-	// Проверяем кэшированную маржу
 	for _, exch := range []string{longExch, shortExch} {
+		// Сначала проверяем кэш
 		if margin, ok := ad.marginCache.Load(exch); ok {
 			if margin.(float64) < requiredMargin/2 {
 				return false, fmt.Sprintf("insufficient margin on %s: need %.2f USDT", exch, requiredMargin/2)
 			}
+			continue
 		}
-		// Если маржа не в кэше, пропускаем проверку (предполагаем достаточно)
+
+		// При отсутствии кэша — прямой запрос баланса (короткий тайм-аут)
+		if ad.balanceFetcher == nil {
+			return false, fmt.Sprintf("margin data unavailable for %s", exch)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		available, err := ad.balanceFetcher(ctx, exch)
+		cancel()
+		if err != nil {
+			return false, fmt.Sprintf("failed to fetch margin for %s: %v", exch, err)
+		}
+
+		ad.marginCache.Store(exch, available)
+		if available < requiredMargin/2 {
+			return false, fmt.Sprintf("insufficient margin on %s: need %.2f USDT", exch, requiredMargin/2)
+		}
 	}
 
 	return true, ""
@@ -339,11 +359,11 @@ type ExitReason string
 
 const (
 	ExitReasonNone        ExitReason = ""
-	ExitReasonSpread      ExitReason = "spread_reached"      // спред достиг порога выхода
-	ExitReasonStopLoss    ExitReason = "stop_loss"           // достигнут stop loss
-	ExitReasonLiquidation ExitReason = "liquidation"         // ликвидация позиции
-	ExitReasonManual      ExitReason = "manual"              // ручное закрытие
-	ExitReasonError       ExitReason = "error"               // ошибка
+	ExitReasonSpread      ExitReason = "spread_reached" // спред достиг порога выхода
+	ExitReasonStopLoss    ExitReason = "stop_loss"      // достигнут stop loss
+	ExitReasonLiquidation ExitReason = "liquidation"    // ликвидация позиции
+	ExitReasonManual      ExitReason = "manual"         // ручное закрытие
+	ExitReasonError       ExitReason = "error"          // ошибка
 )
 
 // CheckExitConditions проверяет условия для выхода из позиции
@@ -479,9 +499,10 @@ func NewPartialEntryManager(
 // Алгоритм:
 // 1. Разбиваем объём на N частей
 // 2. Для каждой части:
-//    - Проверяем текущий спред (должен оставаться >= minSpread)
-//    - Отправляем ордера параллельно на обе биржи
-//    - Аккумулируем результаты
+//   - Проверяем текущий спред (должен оставаться >= minSpread)
+//   - Отправляем ордера параллельно на обе биржи
+//   - Аккумулируем результаты
+//
 // 3. Если спред ухудшился - останавливаемся (частичная позиция)
 func (pem *PartialEntryManager) ExecutePartialEntry(
 	ctx context.Context,
@@ -600,29 +621,29 @@ func (pem *PartialEntryManager) ExecutePartialEntry(
 // - Уведомление пользователя о событии
 // - Постановка пары на паузу (опционально)
 type SecondLegFailHandler struct {
-	orderExec    *OrderExecutor
-	notifyChan   chan<- *models.Notification
-	pauseOnFail  bool
+	orderExec   *OrderExecutor
+	notifyChan  chan<- *models.Notification
+	pauseOnFail bool
 }
 
 // SecondLegFailEvent событие провала второй ноги
 type SecondLegFailEvent struct {
-	PairID         int
-	Symbol         string
-	SuccessfulLeg  string // "long" или "short"
+	PairID          int
+	Symbol          string
+	SuccessfulLeg   string // "long" или "short"
 	SuccessExchange string
-	SuccessOrder   interface{} // *exchange.Order
-	FailedLeg      string
-	FailExchange   string
-	FailError      error
-	RollbackResult *RollbackResult
+	SuccessOrder    interface{} // *exchange.Order
+	FailedLeg       string
+	FailExchange    string
+	FailError       error
+	RollbackResult  *RollbackResult
 }
 
 // RollbackResult результат отката первой ноги
 type RollbackResult struct {
-	Success   bool
-	Error     error
-	PnlLoss   float64 // убыток от отката (slippage)
+	Success bool
+	Error   error
+	PnlLoss float64 // убыток от отката (slippage)
 }
 
 // NewSecondLegFailHandler создаёт обработчик провала второй ноги

@@ -291,11 +291,11 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	e := &Engine{
-		cfg:              cfg,
-		ctx:              ctx,
-		cancel:           cancel,
-		exchanges:        make(map[string]exchange.Exchange),
-		pairs:            make(map[int]*PairState),
+		cfg:       cfg,
+		ctx:       ctx,
+		cancel:    cancel,
+		exchanges: make(map[string]exchange.Exchange),
+		pairs:     make(map[int]*PairState),
 		// pairsBySymbol: sync.Map инициализируется автоматически (zero value)
 		// positionIndex: sync.Map инициализируется автоматически (zero value)
 		priceTracker:     NewPriceTracker(numShards),
@@ -331,11 +331,23 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	// Инициализация анализатора стаканов (5 уровней, 5 секунд актуальности)
 	e.orderBookAnalyzer = NewOrderBookAnalyzer(5, 5*time.Second)
 
+	balanceFetcher := func(ctx context.Context, exchangeName string) (float64, error) {
+		e.exchMu.RLock()
+		exch, ok := e.exchanges[exchangeName]
+		e.exchMu.RUnlock()
+		if !ok {
+			return 0, fmt.Errorf("exchange %s not found", exchangeName)
+		}
+
+		return exch.GetBalance(ctx)
+	}
+
 	// Инициализация арбитражного детектора
 	e.arbDetector = NewArbitrageDetector(
 		e.priceTracker,
 		e.spreadCalc,
 		e.orderBookAnalyzer,
+		balanceFetcher,
 	)
 
 	// Инициализация координатора арбитража
@@ -379,9 +391,9 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	// Остальные воркеры
 	go e.positionEventLoop(ctx)
-	go e.periodicTasks(ctx)           // балансы, статистика для UI
-	go e.notificationWorker(ctx)      // обработка уведомлений
-	go e.exitConditionChecker(ctx)    // проверка условий выхода
+	go e.periodicTasks(ctx)        // балансы, статистика для UI
+	go e.notificationWorker(ctx)   // обработка уведомлений
+	go e.exitConditionChecker(ctx) // проверка условий выхода
 
 	<-ctx.Done()
 
@@ -1288,13 +1300,13 @@ func (e *Engine) notifyTradeOpened(ps *PairState, result *ExecuteResult) {
 			longLeg.Exchange, longLeg.EntryPrice,
 			shortLeg.Exchange, shortLeg.EntryPrice),
 		Meta: map[string]interface{}{
-			"symbol":          ps.Config.Symbol,
-			"long_exchange":   longLeg.Exchange,
-			"long_price":      longLeg.EntryPrice,
-			"long_qty":        longLeg.Quantity,
-			"short_exchange":  shortLeg.Exchange,
-			"short_price":     shortLeg.EntryPrice,
-			"short_qty":       shortLeg.Quantity,
+			"symbol":         ps.Config.Symbol,
+			"long_exchange":  longLeg.Exchange,
+			"long_price":     longLeg.EntryPrice,
+			"long_qty":       longLeg.Quantity,
+			"short_exchange": shortLeg.Exchange,
+			"short_price":    shortLeg.EntryPrice,
+			"short_qty":      shortLeg.Quantity,
 		},
 	}
 
