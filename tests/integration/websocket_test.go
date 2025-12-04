@@ -342,9 +342,9 @@ func TestWebSocket_MessageTypes_Integration(t *testing.T) {
 			t.Fatalf("failed to unmarshal: %v", err)
 		}
 
-		// AllBalancesUpdateMessage uses MessageTypeBalanceUpdate ("balanceUpdate")
-		if msg["type"] != "balanceUpdate" {
-			t.Errorf("expected type 'balanceUpdate', got '%v'", msg["type"])
+		// AllBalancesUpdateMessage uses MessageTypeAllBalancesUpdate ("allBalancesUpdate")
+		if msg["type"] != "allBalancesUpdate" {
+			t.Errorf("expected type 'allBalancesUpdate', got '%v'", msg["type"])
 		}
 		// Verify it has balances map
 		if msg["balances"] == nil {
