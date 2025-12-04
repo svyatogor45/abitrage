@@ -65,6 +65,10 @@ type ExecuteResult struct {
 	Success bool
 	Error   error
 
+	// ShouldPause сигнализирует движку поставить пару на паузу
+	// Используется при провале второй ноги после ретраев/отката
+	ShouldPause bool
+
 	// Открытые позиции
 	Legs []models.Leg
 
@@ -114,7 +118,7 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 	if !longOk || !shortOk {
 		return &ExecuteResult{
 			Success: false,
-			Error:   fmt.Errorf("exchange not found: long=%s(%v) short=%s(%v)",
+			Error: fmt.Errorf("exchange not found: long=%s(%v) short=%s(%v)",
 				params.LongExchange, longOk, params.ShortExchange, shortOk),
 		}
 	}
@@ -211,6 +215,11 @@ func (oe *OrderExecutor) handleResults(
 	longRes, shortRes LegResult,
 ) *ExecuteResult {
 
+	partVolume := params.Volume
+	if params.NOrders > 1 {
+		partVolume = params.Volume / float64(params.NOrders)
+	}
+
 	// Оба успешны - проверяем что Order != nil (защита от edge case биржевого API)
 	if longRes.Error == nil && shortRes.Error == nil {
 		if longRes.Order == nil || shortRes.Order == nil {
@@ -242,31 +251,91 @@ func (oe *OrderExecutor) handleResults(
 
 	// Лонг успешен, шорт провалился - откат лонга
 	if longRes.Error == nil && shortRes.Error != nil {
+		retryQty := longRes.Order.FilledQty
+		if retryQty == 0 {
+			retryQty = partVolume
+		}
+
+		retryOrder, retryErr := oe.retrySecondLeg(ctx, params.Symbol, shortExch, exchange.SideSell, retryQty)
+		if retryErr == nil && retryOrder != nil {
+			return &ExecuteResult{
+				Success:    true,
+				LongOrder:  longRes.Order,
+				ShortOrder: retryOrder,
+				Legs: []models.Leg{
+					{
+						Exchange:   params.LongExchange,
+						Side:       "long",
+						EntryPrice: longRes.Order.AvgFillPrice,
+						Quantity:   longRes.Order.FilledQty,
+					},
+					{
+						Exchange:   params.ShortExchange,
+						Side:       "short",
+						EntryPrice: retryOrder.AvgFillPrice,
+						Quantity:   retryOrder.FilledQty,
+					},
+				},
+			}
+		}
+
 		rollbackErr := oe.rollbackLong(params.Symbol, longExch, longRes.Order)
 		if rollbackErr != nil {
 			return &ExecuteResult{
-				Success: false,
-				Error:   fmt.Errorf("short failed AND long rollback failed: short=%w, rollback=%v", shortRes.Error, rollbackErr),
+				Success:     false,
+				Error:       fmt.Errorf("short failed AND long rollback failed: short=%w, rollback=%v", shortRes.Error, rollbackErr),
+				ShouldPause: true,
 			}
 		}
 		return &ExecuteResult{
-			Success: false,
-			Error:   fmt.Errorf("short failed, long rolled back: %w", shortRes.Error),
+			Success:     false,
+			Error:       fmt.Errorf("short failed, retries exhausted, long rolled back: %w (retry err: %v)", shortRes.Error, retryErr),
+			ShouldPause: true,
 		}
 	}
 
 	// Шорт успешен, лонг провалился - откат шорта
 	if shortRes.Error == nil && longRes.Error != nil {
+		retryQty := shortRes.Order.FilledQty
+		if retryQty == 0 {
+			retryQty = partVolume
+		}
+
+		retryOrder, retryErr := oe.retrySecondLeg(ctx, params.Symbol, longExch, exchange.SideBuy, retryQty)
+		if retryErr == nil && retryOrder != nil {
+			return &ExecuteResult{
+				Success:    true,
+				LongOrder:  retryOrder,
+				ShortOrder: shortRes.Order,
+				Legs: []models.Leg{
+					{
+						Exchange:   params.LongExchange,
+						Side:       "long",
+						EntryPrice: retryOrder.AvgFillPrice,
+						Quantity:   retryOrder.FilledQty,
+					},
+					{
+						Exchange:   params.ShortExchange,
+						Side:       "short",
+						EntryPrice: shortRes.Order.AvgFillPrice,
+						Quantity:   shortRes.Order.FilledQty,
+					},
+				},
+			}
+		}
+
 		rollbackErr := oe.rollbackShort(params.Symbol, shortExch, shortRes.Order)
 		if rollbackErr != nil {
 			return &ExecuteResult{
-				Success: false,
-				Error:   fmt.Errorf("long failed AND short rollback failed: long=%w, rollback=%v", longRes.Error, rollbackErr),
+				Success:     false,
+				Error:       fmt.Errorf("long failed AND short rollback failed: long=%w, rollback=%v", longRes.Error, rollbackErr),
+				ShouldPause: true,
 			}
 		}
 		return &ExecuteResult{
-			Success: false,
-			Error:   fmt.Errorf("long failed, short rolled back: %w", longRes.Error),
+			Success:     false,
+			Error:       fmt.Errorf("long failed, retries exhausted, short rolled back: %w (retry err: %v)", longRes.Error, retryErr),
+			ShouldPause: true,
 		}
 	}
 
@@ -321,6 +390,31 @@ func (oe *OrderExecutor) rollbackShortWithCtx(parentCtx context.Context, symbol 
 		return fmt.Errorf("CRITICAL: failed to rollback short on %s: %w", exch.GetName(), err)
 	}
 	return nil
+}
+
+// retrySecondLeg пытается открыть вторую ногу с экспоненциальным backoff
+// Возвращает Order при успешном исполнении или ошибку после исчерпания попыток
+func (oe *OrderExecutor) retrySecondLeg(ctx context.Context, symbol string, exch exchange.Exchange, side exchange.Side, qty float64) (*exchange.Order, error) {
+	// Используем агрессивный бэкофф, но ограничиваем максимальной задержкой чтобы не копить латентность
+	cfg := retry.Config{
+		MaxRetries:   oe.cfg.Bot.MaxRetries,
+		InitialDelay: oe.cfg.Bot.RetryBackoff,
+		MaxDelay:     oe.cfg.Bot.RetryBackoff * 8,
+		Multiplier:   2.0,
+		JitterFactor: 0.1,
+		RetryIf:      retry.RetryIfNotContext,
+	}
+
+	return retry.DoWithResult(ctx, func() (*exchange.Order, error) {
+		order, err := exch.PlaceMarketOrder(ctx, symbol, side, qty)
+		if err != nil {
+			return nil, err
+		}
+		if order == nil {
+			return nil, fmt.Errorf("retrySecondLeg: nil order from %s", exch.GetName())
+		}
+		return order, nil
+	}, cfg)
 }
 
 // CloseParallel закрывает позиции параллельно
@@ -385,9 +479,9 @@ func (oe *OrderExecutor) closeSingleLeg(ctx context.Context, symbol string, leg 
 	}
 
 	return &ExecuteResult{
-		Success:    true,
-		LongOrder:  order, // используем LongOrder для единственной ноги
-		TotalPnl:   pnl,
+		Success:   true,
+		LongOrder: order, // используем LongOrder для единственной ноги
+		TotalPnl:  pnl,
 	}
 }
 
@@ -528,9 +622,9 @@ type OrderValidator struct {
 	priceGetter func(symbol, exchange string) float64
 
 	// Дефолтные значения если лимиты не загружены
-	defaultMinQty    float64
-	defaultMaxQty    float64
-	defaultQtyStep   float64
+	defaultMinQty      float64
+	defaultMaxQty      float64
+	defaultQtyStep     float64
 	defaultMinNotional float64
 }
 
@@ -542,30 +636,30 @@ type LimitsKey struct {
 
 // CachedLimits - кэшированные лимиты с timestamp
 type CachedLimits struct {
-	MinOrderQty  float64
-	MaxOrderQty  float64
-	QtyStep      float64 // lot size
-	MinNotional  float64
-	PriceStep    float64 // tick size
-	MaxLeverage  int
-	UpdatedAt    time.Time
+	MinOrderQty float64
+	MaxOrderQty float64
+	QtyStep     float64 // lot size
+	MinNotional float64
+	PriceStep   float64 // tick size
+	MaxLeverage int
+	UpdatedAt   time.Time
 }
 
 // ValidationResult - результат валидации
 type ValidationResult struct {
-	Valid        bool
-	AdjustedQty  float64 // скорректированный объём
-	Error        string  // описание ошибки если Invalid
-	Warnings     []string
+	Valid       bool
+	AdjustedQty float64 // скорректированный объём
+	Error       string  // описание ошибки если Invalid
+	Warnings    []string
 }
 
 // NewOrderValidator создаёт валидатор ордеров
 func NewOrderValidator(priceGetter func(symbol, exchange string) float64) *OrderValidator {
 	return &OrderValidator{
-		priceGetter:      priceGetter,
-		defaultMinQty:    0.001,    // 0.001 BTC
-		defaultMaxQty:    1000.0,   // 1000 BTC
-		defaultQtyStep:   0.001,    // 0.001 BTC
+		priceGetter:        priceGetter,
+		defaultMinQty:      0.001,  // 0.001 BTC
+		defaultMaxQty:      1000.0, // 1000 BTC
+		defaultQtyStep:     0.001,  // 0.001 BTC
 		defaultMinNotional: 5.0,    // 5 USDT минимальная сумма
 	}
 }
@@ -578,13 +672,13 @@ func (ov *OrderValidator) UpdateLimits(exchangeName, symbol string, limits *exch
 
 	key := LimitsKey{Exchange: exchangeName, Symbol: symbol}
 	cached := &CachedLimits{
-		MinOrderQty:  limits.MinOrderQty,
-		MaxOrderQty:  limits.MaxOrderQty,
-		QtyStep:      limits.QtyStep,
-		MinNotional:  limits.MinNotional,
-		PriceStep:    limits.PriceStep,
-		MaxLeverage:  limits.MaxLeverage,
-		UpdatedAt:    time.Now(),
+		MinOrderQty: limits.MinOrderQty,
+		MaxOrderQty: limits.MaxOrderQty,
+		QtyStep:     limits.QtyStep,
+		MinNotional: limits.MinNotional,
+		PriceStep:   limits.PriceStep,
+		MaxLeverage: limits.MaxLeverage,
+		UpdatedAt:   time.Now(),
 	}
 
 	ov.limits.Store(key, cached)
