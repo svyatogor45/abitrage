@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"errors"
 	"testing"
 
 	"arbitrage/internal/models"
@@ -140,8 +141,8 @@ func TestCanTransition_InvalidTransitions(t *testing.T) {
 		{name: "ENTERING → EXITING (invalid, skip HOLDING)", from: models.StateEntering, to: models.StateExiting},
 		{name: "ENTERING → ENTERING (invalid)", from: models.StateEntering, to: models.StateEntering},
 
-		// Из HOLDING нельзя напрямую в PAUSED/READY/ENTERING
-		{name: "HOLDING → PAUSED (invalid, must go through EXITING)", from: models.StateHolding, to: models.StatePaused},
+		// Из HOLDING нельзя напрямую в READY/ENTERING (но можно в PAUSED при SL/ликвидации)
+		// HOLDING → PAUSED разрешён для аварийных случаев (SL, ликвидация)
 		{name: "HOLDING → READY (invalid, must go through EXITING)", from: models.StateHolding, to: models.StateReady},
 		{name: "HOLDING → ENTERING (invalid)", from: models.StateHolding, to: models.StateEntering},
 		{name: "HOLDING → HOLDING (invalid)", from: models.StateHolding, to: models.StateHolding},
@@ -521,5 +522,86 @@ func BenchmarkIsActive(b *testing.B) {
 func BenchmarkHasOpenPosition(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		HasOpenPosition(models.StateHolding)
+	}
+}
+
+// TestTryTransition проверяет атомарный переход состояния
+func TestTryTransition(t *testing.T) {
+	tests := []struct {
+		name      string
+		from      string
+		to        string
+		wantErr   bool
+		wantState string
+	}{
+		{
+			name:      "valid READY → ENTERING",
+			from:      models.StateReady,
+			to:        models.StateEntering,
+			wantErr:   false,
+			wantState: models.StateEntering,
+		},
+		{
+			name:      "valid ENTERING → HOLDING",
+			from:      models.StateEntering,
+			to:        models.StateHolding,
+			wantErr:   false,
+			wantState: models.StateHolding,
+		},
+		{
+			name:      "invalid PAUSED → HOLDING",
+			from:      models.StatePaused,
+			to:        models.StateHolding,
+			wantErr:   true,
+			wantState: models.StatePaused, // состояние не должно измениться
+		},
+		{
+			name:      "invalid READY → EXITING",
+			from:      models.StateReady,
+			to:        models.StateExiting,
+			wantErr:   true,
+			wantState: models.StateReady, // состояние не должно измениться
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime := &models.PairRuntime{State: tt.from}
+			err := TryTransition(runtime, 1, tt.to)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("TryTransition() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if runtime.State != tt.wantState {
+				t.Errorf("TryTransition() state = %s, want %s", runtime.State, tt.wantState)
+			}
+			if tt.wantErr {
+				var transErr *StateTransitionError
+				if !errors.As(err, &transErr) {
+					t.Errorf("TryTransition() error should be StateTransitionError, got %T", err)
+				}
+			}
+		})
+	}
+}
+
+// TestForceTransition проверяет принудительный переход
+func TestForceTransition(t *testing.T) {
+	runtime := &models.PairRuntime{State: models.StateReady}
+
+	// ForceTransition должен работать даже для невалидных переходов
+	ForceTransition(runtime, models.StateHolding) // READY → HOLDING невалиден
+
+	if runtime.State != models.StateHolding {
+		t.Errorf("ForceTransition() state = %s, want %s", runtime.State, models.StateHolding)
+	}
+}
+
+// BenchmarkTryTransition измеряет производительность атомарного перехода
+func BenchmarkTryTransition(b *testing.B) {
+	runtime := &models.PairRuntime{State: models.StateReady}
+	for i := 0; i < b.N; i++ {
+		runtime.State = models.StateReady
+		TryTransition(runtime, 1, models.StateEntering)
 	}
 }

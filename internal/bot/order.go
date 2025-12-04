@@ -155,11 +155,23 @@ func (oe *OrderExecutor) ExecuteParallel(ctx context.Context, params ExecutePara
 			shortReceived = true
 		case <-ctx.Done():
 			// Timeout - откатываем то, что успело исполниться
+			var rollbackErrors []error
 			if longReceived && longResult.Error == nil {
-				oe.rollbackLong(params.Symbol, longExch, longResult.Order)
+				if err := oe.rollbackLong(params.Symbol, longExch, longResult.Order); err != nil {
+					rollbackErrors = append(rollbackErrors, err)
+				}
 			}
 			if shortReceived && shortResult.Error == nil {
-				oe.rollbackShort(params.Symbol, shortExch, shortResult.Order)
+				if err := oe.rollbackShort(params.Symbol, shortExch, shortResult.Order); err != nil {
+					rollbackErrors = append(rollbackErrors, err)
+				}
+			}
+			// Включаем ошибки отката в итоговую ошибку
+			if len(rollbackErrors) > 0 {
+				return &ExecuteResult{
+					Success: false,
+					Error:   fmt.Errorf("timeout with rollback failures: %v, rollback errors: %v", ctx.Err(), rollbackErrors),
+				}
 			}
 			return &ExecuteResult{Success: false, Error: ctx.Err()}
 		}
@@ -202,7 +214,13 @@ func (oe *OrderExecutor) handleResults(
 
 	// Лонг успешен, шорт провалился - откат лонга
 	if longRes.Error == nil && shortRes.Error != nil {
-		oe.rollbackLong(params.Symbol, longExch, longRes.Order)
+		rollbackErr := oe.rollbackLong(params.Symbol, longExch, longRes.Order)
+		if rollbackErr != nil {
+			return &ExecuteResult{
+				Success: false,
+				Error:   fmt.Errorf("short failed AND long rollback failed: short=%w, rollback=%v", shortRes.Error, rollbackErr),
+			}
+		}
 		return &ExecuteResult{
 			Success: false,
 			Error:   fmt.Errorf("short failed, long rolled back: %w", shortRes.Error),
@@ -211,7 +229,13 @@ func (oe *OrderExecutor) handleResults(
 
 	// Шорт успешен, лонг провалился - откат шорта
 	if shortRes.Error == nil && longRes.Error != nil {
-		oe.rollbackShort(params.Symbol, shortExch, shortRes.Order)
+		rollbackErr := oe.rollbackShort(params.Symbol, shortExch, shortRes.Order)
+		if rollbackErr != nil {
+			return &ExecuteResult{
+				Success: false,
+				Error:   fmt.Errorf("long failed AND short rollback failed: long=%w, rollback=%v", longRes.Error, rollbackErr),
+			}
+		}
 		return &ExecuteResult{
 			Success: false,
 			Error:   fmt.Errorf("long failed, short rolled back: %w", longRes.Error),
@@ -226,42 +250,115 @@ func (oe *OrderExecutor) handleResults(
 }
 
 // rollbackLong закрывает лонг при ошибке шорта
-func (oe *OrderExecutor) rollbackLong(symbol string, exch exchange.Exchange, order *exchange.Order) {
+// Возвращает ошибку если откат не удался (для логирования)
+func (oe *OrderExecutor) rollbackLong(symbol string, exch exchange.Exchange, order *exchange.Order) error {
 	if order == nil || order.FilledQty == 0 {
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), oe.cfg.OrderTimeout)
 	defer cancel()
 
 	// Продаём то, что купили
-	_, _ = exch.PlaceMarketOrder(ctx, symbol, exchange.SideSell, order.FilledQty)
+	_, err := exch.PlaceMarketOrder(ctx, symbol, exchange.SideSell, order.FilledQty)
+	if err != nil {
+		// Логируем критическую ошибку - позиция осталась открытой!
+		// TODO: добавить алерт через notification channel
+		return fmt.Errorf("CRITICAL: failed to rollback long on %s: %w", exch.GetName(), err)
+	}
+	return nil
 }
 
 // rollbackShort закрывает шорт при ошибке лонга
-func (oe *OrderExecutor) rollbackShort(symbol string, exch exchange.Exchange, order *exchange.Order) {
+// Возвращает ошибку если откат не удался (для логирования)
+func (oe *OrderExecutor) rollbackShort(symbol string, exch exchange.Exchange, order *exchange.Order) error {
 	if order == nil || order.FilledQty == 0 {
-		return
+		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), oe.cfg.OrderTimeout)
 	defer cancel()
 
 	// Покупаем то, что продали
-	_, _ = exch.PlaceMarketOrder(ctx, symbol, exchange.SideBuy, order.FilledQty)
+	_, err := exch.PlaceMarketOrder(ctx, symbol, exchange.SideBuy, order.FilledQty)
+	if err != nil {
+		// Логируем критическую ошибку - позиция осталась открытой!
+		// TODO: добавить алерт через notification channel
+		return fmt.Errorf("CRITICAL: failed to rollback short on %s: %w", exch.GetName(), err)
+	}
+	return nil
 }
 
-// CloseParallel закрывает обе позиции параллельно
+// CloseParallel закрывает позиции параллельно
+// Поддерживает 1 или 2 ноги (1 нога для rollback, 2 для полного закрытия)
 //
 // ОПТИМИЗАЦИЯ: использует sync.Pool для каналов - без аллокаций на каждый ордер
 func (oe *OrderExecutor) CloseParallel(ctx context.Context, params CloseParams) *ExecuteResult {
 	legs := params.Legs
 	symbol := params.Symbol
 
-	if len(legs) != 2 {
-		return &ExecuteResult{Success: false, Error: fmt.Errorf("expected 2 legs, got %d", len(legs))}
+	if len(legs) == 0 || len(legs) > 2 {
+		return &ExecuteResult{Success: false, Error: fmt.Errorf("expected 1 or 2 legs, got %d", len(legs))}
 	}
 
+	// Случай одной ноги (rollback)
+	if len(legs) == 1 {
+		return oe.closeSingleLeg(ctx, symbol, legs[0])
+	}
+
+	// Случай двух ног (полное закрытие)
+	return oe.closeTwoLegs(ctx, symbol, legs)
+}
+
+// closeSingleLeg закрывает одну ногу (для rollback)
+func (oe *OrderExecutor) closeSingleLeg(ctx context.Context, symbol string, leg models.Leg) *ExecuteResult {
+	oe.mu.RLock()
+	exch, ok := oe.exchanges[leg.Exchange]
+	oe.mu.RUnlock()
+
+	if !ok {
+		return &ExecuteResult{
+			Success: false,
+			Error:   fmt.Errorf("exchange %s not found", leg.Exchange),
+		}
+	}
+
+	// Определяем сторону закрытия
+	var side string
+	if leg.Side == "long" {
+		side = exchange.SideSell // закрываем лонг продажей
+	} else {
+		side = exchange.SideBuy // закрываем шорт покупкой
+	}
+
+	order, err := exch.PlaceMarketOrder(ctx, symbol, side, leg.Quantity)
+	if err != nil {
+		return &ExecuteResult{
+			Success: false,
+			Error:   fmt.Errorf("close single leg failed: %w", err),
+		}
+	}
+
+	// Рассчитываем PNL
+	var pnl float64
+	if order != nil && order.AvgFillPrice > 0 && leg.EntryPrice > 0 {
+		closePrice := order.AvgFillPrice
+		if leg.Side == "long" {
+			pnl = (closePrice - leg.EntryPrice) * leg.Quantity
+		} else {
+			pnl = (leg.EntryPrice - closePrice) * leg.Quantity
+		}
+	}
+
+	return &ExecuteResult{
+		Success:    true,
+		LongOrder:  order, // используем LongOrder для единственной ноги
+		TotalPnl:   pnl,
+	}
+}
+
+// closeTwoLegs закрывает обе ноги параллельно
+func (oe *OrderExecutor) closeTwoLegs(ctx context.Context, symbol string, legs []models.Leg) *ExecuteResult {
 	oe.mu.RLock()
 	exch1, ok1 := oe.exchanges[legs[0].Exchange]
 	exch2, ok2 := oe.exchanges[legs[1].Exchange]
