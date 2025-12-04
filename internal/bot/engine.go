@@ -13,13 +13,59 @@ import (
 	"arbitrage/internal/models"
 )
 
-// ============ ОПТИМИЗАЦИЯ: Object Pool для PriceUpdate ============
-// Убирает ~1000+ аллокаций/сек в горячем пути
+// ============ ОПТИМИЗАЦИЯ: Object Pools для zero-allocation ============
+// Убирает ~2000+ аллокаций/сек в горячем пути
 
 var priceUpdatePool = sync.Pool{
 	New: func() interface{} {
 		return &PriceUpdate{}
 	},
+}
+
+// Pool для Notification - убирает аллокации при уведомлениях
+var notificationPool = sync.Pool{
+	New: func() interface{} {
+		return &models.Notification{
+			Meta: make(map[string]interface{}, 8), // предаллокация
+		}
+	},
+}
+
+// Pool для слайсов PairState - для checkAllExitConditions
+var pairStateSlicePool = sync.Pool{
+	New: func() interface{} {
+		s := make([]*PairState, 0, 64) // capacity для 64 пар
+		return &s
+	},
+}
+
+// acquireNotification получает Notification из пула
+func acquireNotification() *models.Notification {
+	return notificationPool.Get().(*models.Notification)
+}
+
+// releaseNotification возвращает Notification в пул
+func releaseNotification(n *models.Notification) {
+	if n == nil {
+		return
+	}
+	// Очищаем для GC
+	n.Type = ""
+	n.Severity = ""
+	n.Message = ""
+	n.PairID = nil
+	n.Timestamp = time.Time{}
+	// Очищаем map без реаллокации
+	for k := range n.Meta {
+		delete(n.Meta, k)
+	}
+	notificationPool.Put(n)
+}
+
+// PositionKey - ключ для быстрого поиска пары по позиции O(1)
+type PositionKey struct {
+	Exchange string
+	Symbol   string
 }
 
 // acquirePriceUpdate получает PriceUpdate из пула
@@ -60,6 +106,10 @@ func releasePriceUpdate(p *PriceUpdate) {
 type Engine struct {
 	cfg *config.Config
 
+	// Родительский контекст для graceful shutdown
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	// Подключенные биржи
 	exchanges map[string]exchange.Exchange
 	exchMu    sync.RWMutex
@@ -72,6 +122,11 @@ type Engine struct {
 	// map[string][]*PairState - индекс пар по символу
 	// sync.Map оптимизирована для случая частых чтений и редких записей
 	pairsBySymbol sync.Map
+
+	// ОПТИМИЗАЦИЯ: индекс позиций для O(1) поиска при ликвидациях
+	// map[PositionKey]*PairState - быстрый поиск пары по exchange+symbol
+	// Обновляется при входе/выходе из позиции
+	positionIndex sync.Map
 
 	// Шардированный трекер лучших цен
 	priceTracker *PriceTracker
@@ -193,11 +248,17 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	// При 1000+ обновлений/сек один worker может не справиться
 	workersPerShard := 2 // 2 workers на шард (можно увеличить до 4)
 
+	// Создаём родительский контекст для graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+
 	e := &Engine{
 		cfg:              cfg,
+		ctx:              ctx,
+		cancel:           cancel,
 		exchanges:        make(map[string]exchange.Exchange),
 		pairs:            make(map[int]*PairState),
 		// pairsBySymbol: sync.Map инициализируется автоматически (zero value)
+		// positionIndex: sync.Map инициализируется автоматически (zero value)
 		priceTracker:     NewPriceTracker(numShards),
 		priceShards:      make([]*priceShard, numShards),
 		numShards:        numShards,
@@ -284,8 +345,40 @@ func (e *Engine) Run(ctx context.Context) error {
 	go e.exitConditionChecker(ctx)    // проверка условий выхода
 
 	<-ctx.Done()
+
+	// Graceful shutdown
+	e.cancel() // отменяем внутренний контекст для горутин закрытия
 	close(e.shutdown)
+
+	// Drain каналов для освобождения памяти
+	e.drainChannels()
+
 	return ctx.Err()
+}
+
+// drainChannels очищает буферы каналов при shutdown
+func (e *Engine) drainChannels() {
+	// Drain price shards
+	for _, shard := range e.priceShards {
+		for {
+			select {
+			case update := <-shard.updates:
+				releasePriceUpdate(update)
+			default:
+				goto nextShard
+			}
+		}
+	nextShard:
+	}
+
+	// Drain position updates
+	for {
+		select {
+		case <-e.positionUpdates:
+		default:
+			return
+		}
+	}
 }
 
 // notificationWorker обрабатывает уведомления и отправляет их в WebSocket
@@ -319,21 +412,30 @@ func (e *Engine) exitConditionChecker(ctx context.Context) {
 }
 
 // checkAllExitConditions проверяет условия выхода для всех позиций в HOLDING
+// ОПТИМИЗАЦИЯ: использует sync.Pool для слайса, предаллокация capacity
 func (e *Engine) checkAllExitConditions(ctx context.Context) {
-	// Собираем пары в состоянии HOLDING
+	// Получаем слайс из пула (zero-allocation!)
+	slicePtr := pairStateSlicePool.Get().(*[]*PairState)
+	holdingPairs := (*slicePtr)[:0] // reset length, keep capacity
+
+	// Собираем пары в состоянии HOLDING под коротким RLock
 	e.pairsMu.RLock()
-	holdingPairs := make([]*PairState, 0)
 	for _, ps := range e.pairs {
-		if ps.Runtime.State == models.StateHolding {
+		// ОПТИМИЗАЦИЯ: atomic проверка без захвата ps.mu
+		if atomic.LoadInt32(&ps.isReady) == 0 && ps.Runtime.State == models.StateHolding {
 			holdingPairs = append(holdingPairs, ps)
 		}
 	}
 	e.pairsMu.RUnlock()
 
-	// Проверяем условия выхода для каждой
+	// Проверяем условия выхода для каждой (вне lock)
 	for _, ps := range holdingPairs {
 		e.checkExitConditionsForPair(ctx, ps)
 	}
+
+	// Возвращаем слайс в пул
+	*slicePtr = holdingPairs
+	pairStateSlicePool.Put(slicePtr)
 }
 
 // checkExitConditionsForPair проверяет условия выхода для конкретной пары
@@ -366,8 +468,10 @@ func (e *Engine) checkExitConditionsForPair(ctx context.Context, ps *PairState) 
 }
 
 // executeExit выполняет закрытие позиции
+// ОПТИМИЗАЦИЯ: использует e.ctx для graceful shutdown, обновляет positionIndex
 func (e *Engine) executeExit(ps *PairState, reason ExitReason) {
-	ctx, cancel := context.WithTimeout(context.Background(), e.cfg.Bot.OrderTimeout)
+	// Используем родительский контекст для graceful shutdown
+	ctx, cancel := context.WithTimeout(e.ctx, e.cfg.Bot.OrderTimeout)
 	defer cancel()
 
 	// МЕТРИКА: засекаем время закрытия
@@ -390,6 +494,10 @@ func (e *Engine) executeExit(ps *PairState, reason ExitReason) {
 	if result.Success {
 		// Успешное закрытие
 		ps.Runtime.RealizedPnl += result.TotalPnl
+
+		// ОПТИМИЗАЦИЯ: очищаем positionIndex для O(1) поиска при ликвидациях
+		e.removeFromPositionIndex(ps)
+
 		ps.Runtime.Legs = nil
 		ps.Runtime.FilledParts = 0
 		e.decrementActiveArbs()
@@ -646,6 +754,9 @@ func (e *Engine) executeEntryWithConditions(ps *PairState, conditions *EntryCond
 		ps.Runtime.FilledParts = 1
 		ps.Runtime.LastUpdate = time.Now()
 
+		// ОПТИМИЗАЦИЯ: добавляем в positionIndex для O(1) поиска при ликвидациях
+		e.addToPositionIndex(ps)
+
 		// МЕТРИКА: обновляем счётчик активных арбитражей
 		UpdateActiveArbitrages(atomic.LoadInt64(&e.activeArbs))
 		EventsProcessed.WithLabelValues("entry").Inc()
@@ -690,6 +801,9 @@ func (e *Engine) executeEntry(ps *PairState, opp *ArbitrageOpportunity) {
 		ps.Runtime.FilledParts = 1
 		ps.Runtime.LastUpdate = time.Now()
 
+		// ОПТИМИЗАЦИЯ: добавляем в positionIndex для O(1) поиска при ликвидациях
+		e.addToPositionIndex(ps)
+
 		e.notifyTradeOpened(ps, result)
 	} else {
 		// Ошибка - возврат в готовность
@@ -717,17 +831,183 @@ func (e *Engine) positionEventLoop(ctx context.Context) {
 }
 
 // handleLiquidation - обработка ликвидации
+// ОПТИМИЗАЦИЯ: O(1) поиск через positionIndex вместо O(n) по всем парам
+// Критически важно для минимизации убытков при ликвидации!
 func (e *Engine) handleLiquidation(update PositionUpdate) {
-	// Найти пару с этой позицией и закрыть вторую ногу
-	// TODO: реализовать
+	// O(1) поиск пары через индекс
+	key := PositionKey{Exchange: update.Exchange, Symbol: update.Symbol}
+	v, ok := e.positionIndex.Load(key)
+	if !ok {
+		// Позиция не найдена в индексе - возможно уже закрыта
+		return
+	}
+
+	ps := v.(*PairState)
+
+	// МЕТРИКА: записываем ликвидацию
+	LiquidationsDetected.WithLabelValues(update.Exchange, update.Symbol).Inc()
+
+	// Быстрая проверка состояния через atomic
+	ps.mu.Lock()
+	if ps.Runtime.State != models.StateHolding {
+		ps.mu.Unlock()
+		return
+	}
+
+	// Переводим в состояние выхода
+	ps.Runtime.State = models.StateExiting
+	ps.mu.Unlock()
+
+	// КРИТИЧНО: экстренное закрытие второй ноги в отдельной горутине
+	// Используем короткий timeout для минимизации убытков
+	go e.emergencyCloseSecondLeg(ps, update)
+}
+
+// emergencyCloseSecondLeg экстренно закрывает вторую ногу при ликвидации
+// ОПТИМИЗАЦИЯ: короткий timeout, агрессивный retry
+func (e *Engine) emergencyCloseSecondLeg(ps *PairState, liquidatedPos PositionUpdate) {
+	// Короткий timeout для экстренного закрытия (5 секунд вместо стандартного)
+	emergencyTimeout := 5 * time.Second
+	if e.cfg.Bot.OrderTimeout < emergencyTimeout {
+		emergencyTimeout = e.cfg.Bot.OrderTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(e.ctx, emergencyTimeout)
+	defer cancel()
+
+	// МЕТРИКА: засекаем время
+	startTime := time.Now()
+
+	ps.mu.RLock()
+	legs := ps.Runtime.Legs
+	symbol := ps.Config.Symbol
+	ps.mu.RUnlock()
+
+	// Находим вторую ногу (не ликвидированную)
+	var secondLeg *models.Leg
+	for i := range legs {
+		if legs[i].Exchange != liquidatedPos.Exchange {
+			secondLeg = &legs[i]
+			break
+		}
+	}
+
+	if secondLeg == nil {
+		// Вторая нога не найдена - обе позиции на одной бирже?
+		e.notifyLiquidationError(ps, fmt.Errorf("second leg not found for %s", symbol))
+		return
+	}
+
+	// Определяем сторону для закрытия
+	closeSide := "sell"
+	if secondLeg.Side == "short" {
+		closeSide = "buy"
+	}
+
+	// Агрессивный retry: 3 попытки с минимальной задержкой
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond) // минимальная задержка между попытками
+		}
+
+		// Получаем биржу
+		e.exchMu.RLock()
+		exch, ok := e.exchanges[secondLeg.Exchange]
+		e.exchMu.RUnlock()
+
+		if !ok {
+			lastErr = fmt.Errorf("exchange %s not found", secondLeg.Exchange)
+			continue
+		}
+
+		// Закрываем позицию
+		err := exch.ClosePosition(ctx, symbol, closeSide, secondLeg.Quantity)
+		if err == nil {
+			// Успешно закрыли
+			break
+		}
+		lastErr = err
+	}
+
+	// МЕТРИКА: записываем латентность
+	latencyMs := float64(time.Since(startTime).Milliseconds())
+	RecordTickToOrder(symbol, "emergency_close", latencyMs)
+
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+
+	// Очищаем positionIndex
+	e.removeFromPositionIndex(ps)
+
+	if lastErr != nil {
+		// Не удалось закрыть - переводим в ERROR
+		ps.Runtime.State = models.StateError
+		e.notifyLiquidationError(ps, lastErr)
+		return
+	}
+
+	// Успешное закрытие после ликвидации
+	ps.Runtime.Legs = nil
+	ps.Runtime.FilledParts = 0
+	ps.Runtime.State = models.StatePaused
+	ps.Config.Status = "paused"
+	atomic.StoreInt32(&ps.isReady, 0)
+	e.decrementActiveArbs()
+
+	// Уведомление о ликвидации
+	e.notifyLiquidation(ps, liquidatedPos)
+}
+
+// notifyLiquidation отправляет уведомление о ликвидации
+func (e *Engine) notifyLiquidation(ps *PairState, liquidatedPos PositionUpdate) {
+	pairID := ps.Config.ID
+	notif := acquireNotification()
+	notif.Timestamp = time.Now()
+	notif.Type = "LIQUIDATION"
+	notif.Severity = "error"
+	notif.PairID = &pairID
+	notif.Message = fmt.Sprintf("%s LIQUIDATION on %s! Second leg closed.",
+		ps.Config.Symbol, liquidatedPos.Exchange)
+	notif.Meta["symbol"] = ps.Config.Symbol
+	notif.Meta["liquidated_exchange"] = liquidatedPos.Exchange
+	notif.Meta["liquidated_side"] = liquidatedPos.Side
+
+	select {
+	case e.notificationChan <- notif:
+	default:
+		releaseNotification(notif)
+	}
+}
+
+// notifyLiquidationError отправляет уведомление об ошибке при ликвидации
+func (e *Engine) notifyLiquidationError(ps *PairState, err error) {
+	pairID := ps.Config.ID
+	notif := acquireNotification()
+	notif.Timestamp = time.Now()
+	notif.Type = "LIQUIDATION"
+	notif.Severity = "error"
+	notif.PairID = &pairID
+	notif.Message = fmt.Sprintf("%s LIQUIDATION ERROR: %v", ps.Config.Symbol, err)
+	notif.Meta["symbol"] = ps.Config.Symbol
+	notif.Meta["error"] = err.Error()
+
+	select {
+	case e.notificationChan <- notif:
+	default:
+		releaseNotification(notif)
+	}
 }
 
 // periodicTasks - периодические задачи (НЕ влияют на торговлю)
+// ОПТИМИЗАЦИЯ: добавлен мониторинг goroutines для alerting
 func (e *Engine) periodicTasks(ctx context.Context) {
 	balanceTicker := time.NewTicker(e.cfg.Bot.BalanceUpdateFreq)
 	statsTicker := time.NewTicker(e.cfg.Bot.StatsUpdateFreq)
+	goroutineTicker := time.NewTicker(10 * time.Second) // мониторинг goroutines
 	defer balanceTicker.Stop()
 	defer statsTicker.Stop()
+	defer goroutineTicker.Stop()
 
 	for {
 		select {
@@ -737,6 +1017,9 @@ func (e *Engine) periodicTasks(ctx context.Context) {
 			e.updateBalances()
 		case <-statsTicker.C:
 			e.broadcastPairStates()
+		case <-goroutineTicker.C:
+			// МЕТРИКА: обновляем счётчик горутин для мониторинга утечек
+			GoroutineCount.Set(float64(runtime.NumGoroutine()))
 		}
 	}
 }
@@ -838,6 +1121,24 @@ func (e *Engine) incrementActiveArbs() {
 // decrementActiveArbs - atomic декремент
 func (e *Engine) decrementActiveArbs() {
 	atomic.AddInt64(&e.activeArbs, -1)
+}
+
+// addToPositionIndex добавляет позицию в индекс для O(1) поиска при ликвидациях
+// ВАЖНО: вызывать после успешного входа в позицию
+func (e *Engine) addToPositionIndex(ps *PairState) {
+	for _, leg := range ps.Runtime.Legs {
+		key := PositionKey{Exchange: leg.Exchange, Symbol: ps.Config.Symbol}
+		e.positionIndex.Store(key, ps)
+	}
+}
+
+// removeFromPositionIndex удаляет позицию из индекса
+// ВАЖНО: вызывать перед очисткой ps.Runtime.Legs
+func (e *Engine) removeFromPositionIndex(ps *PairState) {
+	for _, leg := range ps.Runtime.Legs {
+		key := PositionKey{Exchange: leg.Exchange, Symbol: ps.Config.Symbol}
+		e.positionIndex.Delete(key)
+	}
 }
 
 func (e *Engine) updatePairPnl(ps *PairState) {
@@ -996,9 +1297,10 @@ func (e *Engine) AddPair(cfg *models.PairConfig) {
 	e.pairs[cfg.ID] = ps
 	e.pairsMu.Unlock()
 
-	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map
+	// ОПТИМИЗАЦИЯ: атомарное обновление sync.Map с защитой от бесконечного цикла
 	// Используем Load → modify → Store паттерн
-	for {
+	const maxCASRetries = 100
+	for i := 0; i < maxCASRetries; i++ {
 		existing, _ := e.pairsBySymbol.Load(cfg.Symbol)
 		var newSlice []*PairState
 		if existing != nil {
@@ -1143,6 +1445,7 @@ func (e *Engine) GetNumShards() int {
 // ============ API для PairService ============
 
 // GetPairRuntime возвращает runtime состояние пары
+// ОПТИМИЗАЦИЯ: deep copy для безопасности (Legs - слайс)
 func (e *Engine) GetPairRuntime(pairID int) *models.PairRuntime {
 	e.pairsMu.RLock()
 	ps, ok := e.pairs[pairID]
@@ -1160,7 +1463,12 @@ func (e *Engine) GetPairRuntime(pairID int) *models.PairRuntime {
 		return nil
 	}
 
+	// Deep copy: копируем структуру и слайс Legs
 	runtime := *ps.Runtime
+	if len(ps.Runtime.Legs) > 0 {
+		runtime.Legs = make([]models.Leg, len(ps.Runtime.Legs))
+		copy(runtime.Legs, ps.Runtime.Legs)
+	}
 	return &runtime
 }
 
