@@ -1,8 +1,10 @@
 package service
 
 import (
+	"context"
 	"time"
 
+	"arbitrage/internal/exchange"
 	"arbitrage/internal/models"
 	"arbitrage/internal/repository"
 )
@@ -138,8 +140,64 @@ type StatsServiceInterface interface {
 	ResetStats() error
 }
 
+// ExchangeServiceInterface определяет интерфейс сервиса бирж
+type ExchangeServiceInterface interface {
+	// ConnectExchange подключает биржу с API ключами
+	ConnectExchange(ctx context.Context, name, apiKey, secretKey, passphrase string) error
+	// DisconnectExchange отключает биржу
+	DisconnectExchange(ctx context.Context, name string) error
+	// UpdateBalance обновляет баланс биржи
+	UpdateBalance(ctx context.Context, name string) (float64, error)
+	// GetAllExchanges возвращает список всех бирж
+	GetAllExchanges() ([]*models.ExchangeAccount, error)
+	// GetExchangeByName возвращает биржу по имени
+	GetExchangeByName(name string) (*models.ExchangeAccount, error)
+	// GetConnection возвращает активное соединение с биржей
+	GetConnection(ctx context.Context, name string) (exchange.Exchange, error)
+	// UpdateAllBalances обновляет балансы всех подключенных бирж
+	UpdateAllBalances(ctx context.Context) map[string]float64
+	// CountConnected возвращает количество подключенных бирж
+	CountConnected() (int, error)
+	// HasMinimumExchanges проверяет, подключено ли минимум 2 биржи
+	HasMinimumExchanges() (bool, error)
+	// Close закрывает все соединения
+	Close() error
+}
+
+// PairServiceInterface определяет интерфейс сервиса пар
+type PairServiceInterface interface {
+	// CreatePair создает новую торговую пару
+	CreatePair(ctx context.Context, cfg *models.PairConfig) error
+	// UpdatePair обновляет параметры пары
+	UpdatePair(ctx context.Context, id int, params UpdatePairParams) (*models.PairConfig, error)
+	// DeletePair удаляет пару
+	DeletePair(ctx context.Context, id int) error
+	// StartPair запускает мониторинг пары
+	StartPair(ctx context.Context, id int) error
+	// PausePair приостанавливает пару
+	PausePair(ctx context.Context, id int, forceClose bool) error
+	// GetPair возвращает пару по ID
+	GetPair(ctx context.Context, id int) (*models.PairConfig, error)
+	// GetAllPairs возвращает все пары
+	GetAllPairs(ctx context.Context) ([]*models.PairConfig, error)
+	// GetActivePairs возвращает активные пары
+	GetActivePairs(ctx context.Context) ([]*models.PairConfig, error)
+	// GetPairWithRuntime возвращает пару с runtime данными
+	GetPairWithRuntime(ctx context.Context, id int) (*PairWithRuntime, error)
+	// GetPairRuntime возвращает runtime состояние пары
+	GetPairRuntime(id int) *models.PairRuntime
+	// GetPendingConfig возвращает отложенные изменения
+	GetPendingConfig(id int) *PendingConfig
+	// GetPairsCount возвращает количество пар
+	GetPairsCount(ctx context.Context) (int, error)
+	// GetActivePairsCount возвращает количество активных пар
+	GetActivePairsCount(ctx context.Context) (int, error)
+}
+
 // Проверяем, что реальные сервисы реализуют интерфейсы
 var _ BlacklistServiceInterface = (*BlacklistService)(nil)
 var _ SettingsServiceInterface = (*SettingsService)(nil)
 var _ NotificationServiceInterface = (*NotificationService)(nil)
 var _ StatsServiceInterface = (*StatsService)(nil)
+var _ ExchangeServiceInterface = (*ExchangeService)(nil)
+var _ PairServiceInterface = (*PairService)(nil)

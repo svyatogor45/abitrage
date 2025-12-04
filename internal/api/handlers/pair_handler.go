@@ -23,11 +23,11 @@ import (
 // - POST /api/v1/pairs/{id}/start - запуск мониторинга пары
 // - POST /api/v1/pairs/{id}/pause - приостановка пары
 type PairHandler struct {
-	pairService *service.PairService
+	pairService service.PairServiceInterface
 }
 
 // NewPairHandler создает новый PairHandler с внедрением зависимостей
-func NewPairHandler(pairService *service.PairService) *PairHandler {
+func NewPairHandler(pairService service.PairServiceInterface) *PairHandler {
 	return &PairHandler{
 		pairService: pairService,
 	}
@@ -127,6 +127,8 @@ type PendingConfigResponse struct {
 // - 400 Bad Request: невалидные параметры
 // - 409 Conflict: пара уже существует или достигнут лимит
 func (h *PairHandler) CreatePair(w http.ResponseWriter, r *http.Request) {
+	// Ограничиваем размер тела запроса
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
 	var req CreatePairRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body", err.Error())
@@ -250,6 +252,8 @@ func (h *PairHandler) UpdatePair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ограничиваем размер тела запроса
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
 	var req UpdatePairRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "invalid_request", "Invalid JSON body", err.Error())
@@ -511,7 +515,7 @@ func (h *PairHandler) respondWithJSON(w http.ResponseWriter, statusCode int, dat
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if data != nil {
-		json.NewEncoder(w).Encode(data)
+		_ = json.NewEncoder(w).Encode(data)
 	}
 }
 
