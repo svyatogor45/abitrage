@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -284,19 +285,22 @@ func (pm *PositionManager) HandleLiquidation(
 	return nil
 }
 
-// closeOneLeg закрывает одну ногу позиции
+// closeOneLeg закрывает одну ногу позиции через OrderExecutor
 func (pm *PositionManager) closeOneLeg(ctx context.Context, symbol string, leg *models.Leg) error {
-	// Определяем направление закрытия
-	var side string
-	if leg.Side == "long" {
-		side = "sell" // закрываем лонг продажей
-	} else {
-		side = "buy" // закрываем шорт покупкой
+	if pm.orderExec == nil {
+		return fmt.Errorf("orderExecutor not set")
 	}
 
-	// Выполняем закрытие
-	// TODO: использовать OrderExecutor когда он будет расширен
-	_ = side
+	// Используем CloseParallel с одной ногой (поддерживается после fix в order.go)
+	result := pm.orderExec.CloseParallel(ctx, CloseParams{
+		Symbol: symbol,
+		Legs:   []models.Leg{*leg},
+	})
+
+	if !result.Success {
+		return result.Error
+	}
+
 	return nil
 }
 
