@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +15,7 @@ import (
 	"arbitrage/internal/repository"
 	"arbitrage/internal/service"
 	"arbitrage/internal/websocket"
+	"arbitrage/pkg/utils"
 
 	_ "github.com/lib/pq"
 )
@@ -24,17 +24,34 @@ func main() {
 	// Загрузка конфигурации
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		// Используем стандартный log до инициализации логгера
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
 	}
 
+	// Инициализация структурированного логгера
+	logger := utils.InitGlobalLogger(utils.LogConfig{
+		Level:       cfg.Logging.Level,
+		Format:      cfg.Logging.Format,
+		Development: cfg.Logging.Level == "debug",
+	})
+	defer logger.Sync()
+
+	utils.Info("Configuration loaded successfully",
+		utils.String("log_level", cfg.Logging.Level),
+		utils.String("log_format", cfg.Logging.Format),
+	)
+
 	// Инициализация базы данных
-	db, err := initDatabase(cfg)
+	db, err := initDatabase(cfg, logger)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		utils.Fatal("Failed to connect to database", utils.Err(err))
 	}
 	defer db.Close()
 
-	log.Println("Connected to database successfully")
+	utils.Info("Connected to database successfully",
+		utils.String("driver", cfg.Database.Driver),
+	)
 
 	// Инициализация репозиториев
 	exchangeRepo := repository.NewExchangeRepository(db)
@@ -79,7 +96,7 @@ func main() {
 	// Инициализация WebSocket hub
 	wsHub := websocket.NewHub()
 	go wsHub.Run()
-	log.Println("WebSocket hub started")
+	utils.Info("WebSocket hub started")
 
 	// Подключение WebSocket hub к сервисам для real-time обновлений
 	notificationService.SetWebSocketHub(wsHub)
@@ -105,12 +122,9 @@ func main() {
 	router := api.SetupRoutes(deps)
 
 	// HTTP сервер с конфигурируемыми таймаутами
-	// Таймауты можно переопределить через переменные окружения:
-	// - SERVER_READ_TIMEOUT (default: 15s)
-	// - SERVER_WRITE_TIMEOUT (default: 15s)
-	// - SERVER_IDLE_TIMEOUT (default: 60s)
+	serverAddr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	server := &http.Server{
-		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
+		Addr:         serverAddr,
 		Handler:      router,
 		ReadTimeout:  cfg.Server.ReadTimeout,
 		WriteTimeout: cfg.Server.WriteTimeout,
@@ -119,47 +133,58 @@ func main() {
 
 	// Запуск сервера в отдельной горутине
 	go func() {
-		log.Printf("Starting server on %s", server.Addr)
+		utils.Info("Starting HTTP server",
+			utils.String("addr", serverAddr),
+			utils.Bool("https", cfg.Server.UseHTTPS),
+		)
+
+		var serverErr error
 		if cfg.Server.UseHTTPS {
-			if err := server.ListenAndServeTLS(cfg.Server.CertFile, cfg.Server.KeyFile); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Server failed: %v", err)
-			}
+			serverErr = server.ListenAndServeTLS(cfg.Server.CertFile, cfg.Server.KeyFile)
 		} else {
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("Server failed: %v", err)
-			}
+			serverErr = server.ListenAndServe()
+		}
+
+		if serverErr != nil && serverErr != http.ErrServerClosed {
+			utils.Fatal("Server failed", utils.Err(serverErr))
 		}
 	}()
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	sig := <-quit
 
-	log.Println("Shutting down server...")
+	utils.Info("Received shutdown signal",
+		utils.String("signal", sig.String()),
+	)
 
 	// Закрываем соединения с биржами
 	if err := exchangeService.Close(); err != nil {
-		log.Printf("Error closing exchange connections: %v", err)
+		utils.Error("Error closing exchange connections", utils.Err(err))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	utils.Info("Shutting down server gracefully",
+		utils.Duration("timeout", 30*time.Second),
+	)
+
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		utils.Fatal("Server forced to shutdown", utils.Err(err))
 	}
 
-	log.Println("Server exited")
+	utils.Info("Server exited successfully")
 }
 
 // initDatabase создает подключение к базе данных
-func initDatabase(cfg *config.Config) (*sql.DB, error) {
-	// Используем DSN helper из config
+func initDatabase(cfg *config.Config, logger *utils.Logger) (*sql.DB, error) {
 	dsn := cfg.Database.DSN()
 
-	// Логируем DSN без пароля для отладки
-	log.Printf("Connecting to database: %s", cfg.Database.DSNWithoutPassword())
+	utils.Debug("Connecting to database",
+		utils.String("dsn", cfg.Database.DSNWithoutPassword()),
+	)
 
 	db, err := sql.Open(cfg.Database.Driver, dsn)
 	if err != nil {
