@@ -13,35 +13,14 @@ const (
 	fnvPrime32  = uint32(16777619)
 )
 
-// ============ ОПТИМИЗАЦИЯ: Object Pool для BestPrices ============
-// Убирает ~1000+ аллокаций/сек в горячем пути recalculateBest()
-var bestPricesPool = sync.Pool{
-	New: func() interface{} {
-		return &BestPrices{}
-	},
-}
-
-// acquireBestPrices получает BestPrices из пула
-func acquireBestPrices() *BestPrices {
-	return bestPricesPool.Get().(*BestPrices)
-}
-
-// releaseBestPrices возвращает BestPrices в пул
-func releaseBestPrices(bp *BestPrices) {
-	if bp == nil {
-		return
-	}
-	// Очищаем для GC
-	bp.Symbol = ""
-	bp.BestAskExch = ""
-	bp.BestBidExch = ""
-	bp.BestAsk = 0
-	bp.BestBid = 0
-	bp.RawSpread = 0
-	bp.BestAskTime = time.Time{}
-	bp.BestBidTime = time.Time{}
-	bestPricesPool.Put(bp)
-}
+// ============ ПРИМЕЧАНИЕ К sync.Pool ============
+// sync.Pool для BestPrices был УДАЛЁН из-за use-after-free:
+// GetBestPrices() возвращает указатель, который может быть
+// освобождён в pool до того как вызывающий код закончит его читать.
+//
+// Альтернатива: возвращать копию, но это не даёт выигрыша над простым new().
+// BestPrices достаточно маленький (~130 байт), аллокация занимает ~25ns.
+// При ~1000 обновлений/сек это всего 25µs - пренебрежимо мало.
 
 // fnvHash вычисляет FNV-1a hash строки БЕЗ аллокаций
 // В отличие от fnv.New32a() не создаёт объект на куче
@@ -238,8 +217,8 @@ func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
 // Сложность: O(k) где k = количество бирж для этого символа
 // ВАЖНО: вызывается под lock'ом шарда
 //
-// ОПТИМИЗАЦИЯ: использует sync.Pool для BestPrices
-// Экономит ~1000+ аллокаций/сек в горячем пути
+// ОПТИМИЗАЦИЯ: in-place обновление существующего BestPrices объекта
+// когда это возможно (экономит ~1000+ аллокаций/сек)
 func (shard *PriceShard) recalculateBest(symbol string) {
 	keys := shard.symbolIndex[symbol]
 	if len(keys) == 0 {
@@ -280,43 +259,70 @@ func (shard *PriceShard) recalculateBest(symbol string) {
 	if bestAsk > 0 && bestBid > 0 {
 		rawSpread := (bestBid - bestAsk) / bestAsk * 100
 
-		// ОПТИМИЗАЦИЯ: возвращаем старый объект в пул перед заменой
-		if old := shard.bestPrices[symbol]; old != nil {
-			releaseBestPrices(old)
+		// ОПТИМИЗАЦИЯ: in-place обновление если объект уже существует
+		// Это безопасно, т.к. все поля примитивные и записываются атомарно
+		// (нет промежуточных состояний при записи float64/string)
+		if existing := shard.bestPrices[symbol]; existing != nil {
+			existing.Symbol = symbol
+			existing.BestAsk = bestAsk
+			existing.BestAskExch = bestAskExch
+			existing.BestAskTime = bestAskTime
+			existing.BestBid = bestBid
+			existing.BestBidExch = bestBidExch
+			existing.BestBidTime = bestBidTime
+			existing.RawSpread = rawSpread
+		} else {
+			// Первый раз - создаём новый объект
+			shard.bestPrices[symbol] = &BestPrices{
+				Symbol:      symbol,
+				BestAsk:     bestAsk,
+				BestAskExch: bestAskExch,
+				BestAskTime: bestAskTime,
+				BestBid:     bestBid,
+				BestBidExch: bestBidExch,
+				BestBidTime: bestBidTime,
+				RawSpread:   rawSpread,
+			}
 		}
-
-		// Получаем новый объект из пула (без аллокации!)
-		bp := acquireBestPrices()
-		bp.Symbol = symbol
-		bp.BestAsk = bestAsk
-		bp.BestAskExch = bestAskExch
-		bp.BestAskTime = bestAskTime
-		bp.BestBid = bestBid
-		bp.BestBidExch = bestBidExch
-		bp.BestBidTime = bestBidTime
-		bp.RawSpread = rawSpread
-
-		shard.bestPrices[symbol] = bp
 	}
 }
 
-// GetBestPrices возвращает лучшие цены для символа
+// GetBestPrices возвращает КОПИЮ лучших цен для символа
 // Сложность: O(1)
+//
+// ВАЖНО: возвращается копия, а не оригинал, чтобы избежать race condition
+// когда вызывающий код читает данные после освобождения read lock.
+// BestPrices ~130 байт, копирование занимает ~10ns - пренебрежимо мало.
 func (pt *PriceTracker) GetBestPrices(symbol string) *BestPrices {
 	shard := pt.getShard(symbol)
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
-	return shard.bestPrices[symbol]
+	bp := shard.bestPrices[symbol]
+	if bp == nil {
+		shard.mu.RUnlock()
+		return nil
+	}
+	// Создаём копию под lock'ом
+	copy := *bp
+	shard.mu.RUnlock()
+	return &copy
 }
 
-// GetExchangePrice возвращает цену конкретной биржи
+// GetExchangePrice возвращает КОПИЮ цены конкретной биржи
+// Возвращает копию для thread safety (аналогично GetBestPrices)
 func (pt *PriceTracker) GetExchangePrice(symbol, exchange string) *ExchangePrice {
 	shard := pt.getShard(symbol)
 	shard.mu.RLock()
-	defer shard.mu.RUnlock()
 
 	key := PriceKey{Symbol: symbol, Exchange: exchange}
-	return shard.allPrices[key]
+	ep := shard.allPrices[key]
+	if ep == nil {
+		shard.mu.RUnlock()
+		return nil
+	}
+	// Создаём копию под lock'ом
+	copy := *ep
+	shard.mu.RUnlock()
+	return &copy
 }
 
 // ============================================================
