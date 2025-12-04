@@ -159,6 +159,10 @@ func main() {
 		utils.String("signal", sig.String()),
 	)
 
+	// Останавливаем WebSocket hub (graceful shutdown)
+	wsHub.Stop()
+	utils.Info("WebSocket hub stopped")
+
 	// Закрываем соединения с биржами
 	if err := exchangeService.Close(); err != nil {
 		utils.Error("Error closing exchange connections", utils.Err(err))

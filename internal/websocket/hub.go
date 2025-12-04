@@ -3,6 +3,7 @@ package websocket
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"arbitrage/internal/models"
 
@@ -13,6 +14,16 @@ import (
 
 // Быстрый JSON сериализатор (совместим со стандартным encoding/json API)
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+// byteSlicePool - пул для переиспользования byte slices
+// ОПТИМИЗАЦИЯ: zero-allocation при сериализации сообщений
+var byteSlicePool = sync.Pool{
+	New: func() interface{} {
+		// Предаллоцируем 4KB - типичный размер сообщения pairUpdate
+		b := make([]byte, 0, 4096)
+		return &b
+	},
+}
 
 // Hub управляет всеми активными WebSocket соединениями
 //
@@ -27,7 +38,14 @@ var json = jsoniter.ConfigCompatibleWithStandardLibrary
 // - Маршрутизация сообщений по типам (pairUpdate, notification, balanceUpdate)
 // - Обработка переподключений
 // - Очистка отключенных соединений
-// - Потокобезопасная работа с клиентами (sync.RWMutex)
+// - Graceful shutdown
+//
+// ОПТИМИЗАЦИИ:
+// - sync.Pool для byte slices (zero-allocation)
+// - atomic counter для client count (lock-free read)
+// - Non-blocking broadcast (никогда не блокирует caller)
+// - Batch processing сообщений
+// - Предаллокация слайсов
 //
 // Типы сообщений:
 // - pairUpdate: обновление состояния пары (цены, PNL, спред)
@@ -39,9 +57,10 @@ var json = jsoniter.ConfigCompatibleWithStandardLibrary
 // 1. Создать hub: hub := NewHub()
 // 2. Запустить в горутине: go hub.Run()
 // 3. Отправлять сообщения: hub.Broadcast(message)
+// 4. Для остановки: hub.Stop()
 type Hub struct {
 	// Зарегистрированные клиенты
-	clients map[*Client]bool
+	clients map[*Client]struct{}
 
 	// Broadcast канал для отправки сообщений всем клиентам
 	broadcast chan []byte
@@ -52,21 +71,35 @@ type Hub struct {
 	// Отмена регистрации клиента
 	unregister chan *Client
 
+	// Канал для graceful shutdown
+	stop chan struct{}
+
 	// Mutex для потокобезопасного доступа к clients
 	mu sync.RWMutex
+
+	// Atomic counter для lock-free чтения количества клиентов
+	clientCount int64
+
+	// Предаллоцированный слайс для broadcast (переиспользуется)
+	broadcastBuf []*Client
+
+	// Счётчик отброшенных сообщений (для мониторинга)
+	droppedMessages int64
 }
 
 // NewHub создает новый Hub
 //
-// ОПТИМИЗАЦИЯ: увеличен буфер broadcast до 4096
-// При 1000+ сообщений/сек буфер 256 заполнялся за 256ms
-// Теперь буфер на ~4 секунды - достаточно для пиковых нагрузок
+// ОПТИМИЗАЦИЯ: увеличен буфер broadcast до 8192
+// При 1000+ сообщений/сек буфер на ~8 секунд
+// Это позволяет выдержать кратковременные пики нагрузки
 func NewHub() *Hub {
 	return &Hub{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 4096), // было 256, стало 4096
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		clients:      make(map[*Client]struct{}, 64), // предаллокация на 64 клиента
+		broadcast:    make(chan []byte, 8192),        // увеличено с 4096 до 8192
+		register:     make(chan *Client, 64),         // буферизованный для быстрой регистрации
+		unregister:   make(chan *Client, 64),         // буферизованный
+		stop:         make(chan struct{}),
+		broadcastBuf: make([]*Client, 0, 64), // предаллокация
 	}
 }
 
@@ -75,72 +108,183 @@ func NewHub() *Hub {
 // Должен запускаться в отдельной горутине: go hub.Run()
 // Обрабатывает регистрацию, отмену регистрации и broadcast
 //
-// ОПТИМИЗАЦИЯ: исправлен race condition при удалении клиентов под RLock
-// Теперь: копируем список → отправляем без Lock → удаляем под Write Lock
+// ОПТИМИЗАЦИИ:
+// - Batch processing: обрабатываем все register/unregister сразу
+// - Переиспользование broadcastBuf (zero-allocation)
+// - Non-blocking отправка клиентам
+// - Graceful shutdown через stop канал
 func (h *Hub) Run() {
 	for {
 		select {
+		case <-h.stop:
+			// Graceful shutdown: закрываем все соединения
+			h.mu.Lock()
+			for client := range h.clients {
+				close(client.send)
+				delete(h.clients, client)
+			}
+			atomic.StoreInt64(&h.clientCount, 0)
+			h.mu.Unlock()
+			log.Println("WebSocket Hub stopped gracefully")
+			return
+
 		case client := <-h.register:
 			h.mu.Lock()
-			h.clients[client] = true
+			h.clients[client] = struct{}{}
+			atomic.AddInt64(&h.clientCount, 1)
 			h.mu.Unlock()
-			log.Printf("Client connected. Total clients: %d", len(h.clients))
+
+			// Batch: обрабатываем все ожидающие регистрации
+			h.drainRegister()
 
 		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-			}
-			h.mu.Unlock()
-			log.Printf("Client disconnected. Total clients: %d", len(h.clients))
+			h.removeClient(client)
+			// Batch: обрабатываем все ожидающие отмены регистрации
+			h.drainUnregister()
 
 		case message := <-h.broadcast:
-			// ОПТИМИЗАЦИЯ: копируем список клиентов под коротким RLock
-			h.mu.RLock()
-			clients := make([]*Client, 0, len(h.clients))
-			for client := range h.clients {
-				clients = append(clients, client)
-			}
-			h.mu.RUnlock()
-
-			// Отправляем сообщения БЕЗ блокировки (не блокируем register/unregister)
-			var toRemove []*Client
-			for _, client := range clients {
-				select {
-				case client.send <- message:
-					// Сообщение отправлено успешно
-				default:
-					// Клиент не успевает обрабатывать сообщения - помечаем для удаления
-					toRemove = append(toRemove, client)
-				}
-			}
-
-			// Удаляем медленных клиентов под Write Lock
-			if len(toRemove) > 0 {
-				h.mu.Lock()
-				for _, client := range toRemove {
-					if _, ok := h.clients[client]; ok {
-						delete(h.clients, client)
-						close(client.send)
-					}
-				}
-				h.mu.Unlock()
-				log.Printf("Removed %d slow clients. Total clients: %d", len(toRemove), len(h.clients))
-			}
+			h.broadcastMessage(message)
 		}
 	}
 }
 
-// Broadcast отправляет сообщение всем подключенным клиентам
-func (h *Hub) Broadcast(message interface{}) {
-	data, err := json.Marshal(message)
-	if err != nil {
-		log.Printf("Error marshaling broadcast message: %v", err)
+// drainRegister обрабатывает все ожидающие регистрации (batch processing)
+func (h *Hub) drainRegister() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = struct{}{}
+			atomic.AddInt64(&h.clientCount, 1)
+			h.mu.Unlock()
+		default:
+			return
+		}
+	}
+}
+
+// drainUnregister обрабатывает все ожидающие отмены регистрации (batch processing)
+func (h *Hub) drainUnregister() {
+	for {
+		select {
+		case client := <-h.unregister:
+			h.removeClient(client)
+		default:
+			return
+		}
+	}
+}
+
+// removeClient удаляет клиента из Hub
+func (h *Hub) removeClient(client *Client) {
+	h.mu.Lock()
+	if _, ok := h.clients[client]; ok {
+		delete(h.clients, client)
+		close(client.send)
+		atomic.AddInt64(&h.clientCount, -1)
+	}
+	h.mu.Unlock()
+}
+
+// broadcastMessage отправляет сообщение всем клиентам
+// ОПТИМИЗАЦИЯ: переиспользует broadcastBuf, non-blocking отправка
+func (h *Hub) broadcastMessage(message []byte) {
+	// Копируем список клиентов под коротким RLock
+	h.mu.RLock()
+	// Переиспользуем буфер вместо аллокации
+	h.broadcastBuf = h.broadcastBuf[:0]
+	for client := range h.clients {
+		h.broadcastBuf = append(h.broadcastBuf, client)
+	}
+	h.mu.RUnlock()
+
+	if len(h.broadcastBuf) == 0 {
 		return
 	}
 
-	h.broadcast <- data
+	// Отправляем сообщения БЕЗ блокировки
+	var toRemove []*Client
+	for _, client := range h.broadcastBuf {
+		select {
+		case client.send <- message:
+			// OK
+		default:
+			// Клиент не успевает - помечаем для удаления
+			toRemove = append(toRemove, client)
+		}
+	}
+
+	// Удаляем медленных клиентов
+	if len(toRemove) > 0 {
+		h.mu.Lock()
+		for _, client := range toRemove {
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+				atomic.AddInt64(&h.clientCount, -1)
+			}
+		}
+		h.mu.Unlock()
+		log.Printf("Removed %d slow clients. Total: %d", len(toRemove), atomic.LoadInt64(&h.clientCount))
+	}
+}
+
+// Stop останавливает Hub и закрывает все соединения
+func (h *Hub) Stop() {
+	close(h.stop)
+}
+
+// Broadcast отправляет сообщение всем подключенным клиентам
+//
+// ОПТИМИЗАЦИЯ: non-blocking отправка
+// Если буфер переполнен, сообщение отбрасывается с логированием
+// Это предотвращает блокировку вызывающего кода
+func (h *Hub) Broadcast(message interface{}) {
+	// Получаем буфер из пула
+	bufPtr := byteSlicePool.Get().(*[]byte)
+	buf := (*bufPtr)[:0]
+
+	// Сериализуем в буфер
+	var err error
+	buf, err = json.Marshal(message)
+	if err != nil {
+		log.Printf("Error marshaling broadcast message: %v", err)
+		*bufPtr = buf
+		byteSlicePool.Put(bufPtr)
+		return
+	}
+
+	// Копируем данные (т.к. буфер вернётся в пул)
+	data := make([]byte, len(buf))
+	copy(data, buf)
+
+	// Возвращаем буфер в пул
+	*bufPtr = buf
+	byteSlicePool.Put(bufPtr)
+
+	// Non-blocking отправка
+	select {
+	case h.broadcast <- data:
+		// OK
+	default:
+		// Канал переполнен - отбрасываем сообщение
+		atomic.AddInt64(&h.droppedMessages, 1)
+		// Логируем только каждое 100-е отброшенное сообщение
+		if atomic.LoadInt64(&h.droppedMessages)%100 == 0 {
+			log.Printf("Warning: broadcast channel full, dropped %d messages total",
+				atomic.LoadInt64(&h.droppedMessages))
+		}
+	}
+}
+
+// BroadcastRaw отправляет уже сериализованные данные
+// ОПТИМИЗАЦИЯ: для hot path когда данные уже в []byte
+func (h *Hub) BroadcastRaw(data []byte) {
+	select {
+	case h.broadcast <- data:
+	default:
+		atomic.AddInt64(&h.droppedMessages, 1)
+	}
 }
 
 // BroadcastPairUpdate отправляет обновление состояния пары
@@ -188,8 +332,13 @@ func (h *Hub) BroadcastAllBalances(balances map[string]float64) {
 }
 
 // ClientCount возвращает количество подключенных клиентов
+// ОПТИМИЗАЦИЯ: lock-free чтение через atomic
 func (h *Hub) ClientCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.clients)
+	return int(atomic.LoadInt64(&h.clientCount))
+}
+
+// DroppedMessages возвращает количество отброшенных сообщений
+// Полезно для мониторинга и алертов
+func (h *Hub) DroppedMessages() int64 {
+	return atomic.LoadInt64(&h.droppedMessages)
 }

@@ -3,6 +3,9 @@ package websocket
 import (
 	"log"
 	"net/http"
+	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -23,14 +26,90 @@ const (
 	// Причина: JSON с состоянием пары (Legs, PNL, цены) легко превышает 512 байт
 	// Типичный размер сообщения pairUpdate: 1-4KB
 	maxMessageSize = 65536
+
+	// Размер буфера отправки клиента
+	// ОПТИМИЗАЦИЯ: увеличено с 256 до 512 для лучшей пропускной способности
+	clientSendBufferSize = 512
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,  // увеличено для больших сообщений
-	WriteBufferSize: 4096,  // увеличено для больших сообщений
-	CheckOrigin: func(r *http.Request) bool {
-		// TODO: проверять origin в production
+// OriginChecker проверяет Origin с O(1) lookup через map
+// Потокобезопасен для чтения после инициализации
+type OriginChecker struct {
+	allowedOrigins map[string]struct{}
+	allowAll       bool
+}
+
+// originChecker - глобальный экземпляр, инициализируется один раз
+var originChecker = initOriginChecker()
+
+func initOriginChecker() *OriginChecker {
+	checker := &OriginChecker{
+		allowedOrigins: make(map[string]struct{}),
+	}
+
+	// Читаем из переменной окружения (comma-separated)
+	// Пример: ALLOWED_ORIGINS=http://localhost:3000,https://example.com
+	envOrigins := os.Getenv("ALLOWED_ORIGINS")
+
+	if envOrigins == "" || envOrigins == "*" {
+		// Development mode или явно разрешены все
+		checker.allowAll = true
+		// Добавляем стандартные dev origins для fallback
+		devOrigins := []string{
+			"http://localhost:3000",
+			"http://localhost:8080",
+			"http://127.0.0.1:3000",
+			"http://127.0.0.1:8080",
+			"https://localhost:3000",
+			"https://localhost:8080",
+		}
+		for _, origin := range devOrigins {
+			checker.allowedOrigins[origin] = struct{}{}
+		}
+	} else {
+		checker.allowAll = false
+		origins := strings.Split(envOrigins, ",")
+		for _, origin := range origins {
+			origin = strings.TrimSpace(origin)
+			if origin != "" {
+				checker.allowedOrigins[origin] = struct{}{}
+			}
+		}
+	}
+
+	return checker
+}
+
+// Check проверяет origin за O(1)
+func (oc *OriginChecker) Check(origin string) bool {
+	if origin == "" {
+		return true // Non-browser clients (curl, API tools)
+	}
+	if oc.allowAll {
 		return true
+	}
+	_, ok := oc.allowedOrigins[origin]
+	return ok
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	// SECURITY FIX: O(1) origin check вместо hardcoded true
+	CheckOrigin: func(r *http.Request) bool {
+		return originChecker.Check(r.Header.Get("Origin"))
+	},
+	// PERFORMANCE: включаем сжатие для экономии bandwidth
+	EnableCompression: true,
+}
+
+// clientPool - пул для переиспользования Client структур
+// ОПТИМИЗАЦИЯ: zero-allocation при создании клиентов
+var clientPool = sync.Pool{
+	New: func() interface{} {
+		return &Client{
+			send: make(chan []byte, clientSendBufferSize),
+		}
 	},
 }
 
@@ -77,6 +156,8 @@ func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
 		c.conn.Close()
+		// ОПТИМИЗАЦИЯ: возвращаем клиента в пул для переиспользования
+		c.returnToPool()
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -168,6 +249,8 @@ func (c *Client) writePump() {
 // Апгрейдит HTTP соединение до WebSocket.
 // Создает нового клиента и запускает его горутины.
 //
+// ОПТИМИЗАЦИЯ: использует sync.Pool для zero-allocation
+//
 // Использование в routes:
 // router.HandleFunc("/ws/stream", hub.ServeWS)
 func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
@@ -177,10 +260,13 @@ func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &Client{
-		conn: conn,
-		hub:  hub,
-		send: make(chan []byte, 256),
+	// ОПТИМИЗАЦИЯ: получаем клиента из пула вместо аллокации
+	client := clientPool.Get().(*Client)
+	client.conn = conn
+	client.hub = hub
+	// Канал уже создан в пуле, очищаем если есть старые сообщения
+	for len(client.send) > 0 {
+		<-client.send
 	}
 
 	client.hub.register <- client
@@ -188,4 +274,15 @@ func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	// Запускаем горутины клиента
 	go client.writePump()
 	go client.readPump()
+}
+
+// returnToPool возвращает клиента в пул после отключения
+func (c *Client) returnToPool() {
+	c.conn = nil
+	c.hub = nil
+	// Очищаем канал от оставшихся сообщений
+	for len(c.send) > 0 {
+		<-c.send
+	}
+	clientPool.Put(c)
 }

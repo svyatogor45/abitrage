@@ -19,9 +19,13 @@ const (
 	// Отправляется при событиях: открытие, закрытие, SL, ликвидация, ошибки
 	MessageTypeNotification MessageType = "notification"
 
-	// MessageTypeBalanceUpdate - обновление баланса биржи
-	// Отправляется каждую минуту для всех подключенных бирж
+	// MessageTypeBalanceUpdate - обновление баланса одной биржи
+	// Отправляется каждую минуту для каждой подключенной биржи
 	MessageTypeBalanceUpdate MessageType = "balanceUpdate"
+
+	// MessageTypeAllBalancesUpdate - обновление балансов всех бирж
+	// Отправляется при начальной загрузке или массовом обновлении
+	MessageTypeAllBalancesUpdate MessageType = "allBalancesUpdate"
 
 	// MessageTypeStatsUpdate - обновление статистики торговли
 	// Отправляется при изменении статистики (после закрытия сделки)
@@ -287,7 +291,7 @@ type AllBalancesUpdateMessage struct {
 func NewAllBalancesUpdateMessage(balances map[string]float64) *AllBalancesUpdateMessage {
 	return &AllBalancesUpdateMessage{
 		BaseMessage: BaseMessage{
-			Type:      MessageTypeBalanceUpdate,
+			Type:      MessageTypeAllBalancesUpdate, // Отдельный тип для различия на клиенте
 			Timestamp: time.Now(),
 		},
 		Balances: balances,
