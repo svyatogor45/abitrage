@@ -435,7 +435,9 @@ func (rm *RecoveryManager) restoreRuntimeState(matched []*MatchedPosition) {
 
 			if ok {
 				ps.mu.Lock()
-				ps.Runtime.State = models.StateError
+				oldState := ps.Runtime.State
+				ForceTransition(ps.Runtime, models.StateError)
+				RecordTransition(oldState, models.StateError)
 				ps.Config.Status = models.PairStatusPaused
 				ps.mu.Unlock()
 			}
@@ -478,7 +480,9 @@ func (rm *RecoveryManager) restoreRuntimeState(matched []*MatchedPosition) {
 			})
 		}
 
-		ps.Runtime.State = models.StateHolding
+		oldState := ps.Runtime.State
+		ForceTransition(ps.Runtime, models.StateHolding)
+		RecordTransition(oldState, models.StateHolding)
 		ps.Runtime.Legs = legs
 		ps.Runtime.UnrealizedPnl = mp.TotalPnl
 		ps.Runtime.LastUpdate = time.Now()
@@ -547,6 +551,14 @@ func (rm *RecoveryManager) closeOrphanedPositions(
 	var errors []error
 
 	for _, pos := range orphaned {
+		// Проверяем контекст перед каждой операцией закрытия
+		select {
+		case <-ctx.Done():
+			errors = append(errors, fmt.Errorf("context cancelled, stopped closing orphaned positions"))
+			return closed, errors
+		default:
+		}
+
 		exch, ok := exchanges[pos.Exchange]
 		if !ok {
 			errors = append(errors, fmt.Errorf("exchange %s not found for closing position", pos.Exchange))
@@ -665,7 +677,11 @@ func (rm *RecoveryManager) VerifyPositions(ctx context.Context) ([]string, error
 	rm.engine.pairsMu.RLock()
 	holdingPairs := make([]*PairState, 0)
 	for _, ps := range rm.engine.pairs {
-		if ps.Runtime.State == models.StateHolding {
+		// Блокируем пару для чтения состояния (защита от data race)
+		ps.mu.RLock()
+		isHolding := ps.Runtime.State == models.StateHolding
+		ps.mu.RUnlock()
+		if isHolding {
 			holdingPairs = append(holdingPairs, ps)
 		}
 	}
