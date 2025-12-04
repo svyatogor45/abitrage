@@ -34,6 +34,9 @@ type BalanceResponse struct {
 	Currency string  `json:"currency"`
 }
 
+// MaxRequestBodySize ограничение размера тела запроса (1 MB)
+const MaxRequestBodySize = 1 << 20 // 1 MB
+
 // ExchangeHandler отвечает за управление биржевыми аккаунтами
 //
 // Endpoints:
@@ -42,11 +45,11 @@ type BalanceResponse struct {
 // - GET /api/v1/exchanges - получение списка бирж и их статусов
 // - GET /api/v1/exchanges/{name}/balance - обновление баланса биржи
 type ExchangeHandler struct {
-	exchangeService *service.ExchangeService
+	exchangeService service.ExchangeServiceInterface
 }
 
 // NewExchangeHandler создает новый ExchangeHandler
-func NewExchangeHandler(exchangeService *service.ExchangeService) *ExchangeHandler {
+func NewExchangeHandler(exchangeService service.ExchangeServiceInterface) *ExchangeHandler {
 	return &ExchangeHandler{
 		exchangeService: exchangeService,
 	}
@@ -78,13 +81,13 @@ func (h *ExchangeHandler) ConnectExchange(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 2. Декодируем тело запроса
+	// 2. Ограничиваем размер тела запроса и декодируем
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
 	var req ConnectExchangeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.respondWithError(w, http.StatusBadRequest, "Invalid request body", err.Error())
 		return
 	}
-	defer r.Body.Close()
 
 	// 3. Валидация входных данных
 	if req.APIKey == "" {
@@ -266,13 +269,13 @@ func (h *ExchangeHandler) respondWithJSON(w http.ResponseWriter, code int, paylo
 	response, err := json.Marshal(payload)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error":"Failed to marshal response"}`))
+		_, _ = w.Write([]byte(`{"error":"Failed to marshal response"}`))
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	w.Write(response)
+	_, _ = w.Write(response)
 }
 
 // respondWithError отправляет JSON ответ с ошибкой

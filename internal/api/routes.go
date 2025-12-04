@@ -15,13 +15,14 @@ import (
 )
 
 // Dependencies содержит все зависимости для API handlers
+// Используются интерфейсы для облегчения тестирования
 type Dependencies struct {
-	ExchangeService     *service.ExchangeService
-	PairService         *service.PairService
-	StatsService        *service.StatsService
-	SettingsService     *service.SettingsService
-	NotificationService *service.NotificationService
-	BlacklistService    *service.BlacklistService
+	ExchangeService     service.ExchangeServiceInterface
+	PairService         service.PairServiceInterface
+	StatsService        service.StatsServiceInterface
+	SettingsService     service.SettingsServiceInterface
+	NotificationService service.NotificationServiceInterface
+	BlacklistService    service.BlacklistServiceInterface
 	Hub                 *websocket.Hub
 }
 
