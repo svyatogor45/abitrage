@@ -604,16 +604,32 @@ func (h *SecondLegFailHandler) Handle(
 
 	// Создаём уведомление
 	if h.notifyChan != nil {
+		// Формируем сообщение в зависимости от результата отката
+		var message string
+		var severity string
+		if rollbackResult.Success {
+			severity = "warning"
+			message = fmt.Sprintf(
+				"Second leg (%s on %s) failed: %v. First leg (%s on %s) successfully rolled back.",
+				failLeg, failExchange, failError,
+				successLeg, successExchange,
+			)
+		} else {
+			// КРИТИЧНО: откат не удался - есть открытая позиция без хеджа!
+			severity = "critical"
+			message = fmt.Sprintf(
+				"CRITICAL: Second leg (%s on %s) failed: %v. ROLLBACK FAILED for first leg (%s on %s): %v. Manual intervention required!",
+				failLeg, failExchange, failError,
+				successLeg, successExchange, rollbackResult.Error,
+			)
+		}
+
 		notif := &models.Notification{
 			Timestamp: time.Now(),
 			Type:      "SECOND_LEG_FAIL",
-			Severity:  "error",
+			Severity:  severity,
 			PairID:    &pairID,
-			Message: fmt.Sprintf(
-				"Second leg (%s on %s) failed: %v. First leg (%s on %s) rolled back.",
-				failLeg, failExchange, failError,
-				successLeg, successExchange,
-			),
+			Message:   message,
 			Meta: map[string]interface{}{
 				"symbol":           symbol,
 				"success_leg":      successLeg,
@@ -622,6 +638,7 @@ func (h *SecondLegFailHandler) Handle(
 				"fail_exchange":    failExchange,
 				"rollback_success": rollbackResult.Success,
 				"rollback_pnl":     rollbackResult.PnlLoss,
+				"rollback_error":   fmt.Sprintf("%v", rollbackResult.Error),
 			},
 		}
 
@@ -636,6 +653,7 @@ func (h *SecondLegFailHandler) Handle(
 }
 
 // rollback откатывает успешную ногу
+// ВАЖНО: правильно обрабатывает результат закрытия!
 func (h *SecondLegFailHandler) rollback(
 	ctx context.Context,
 	symbol string,
@@ -643,39 +661,45 @@ func (h *SecondLegFailHandler) rollback(
 	exchange string,
 	qty float64,
 ) *RollbackResult {
-	result := &RollbackResult{}
-
-	// Определяем сторону для закрытия
-	var closeSide string
-	if leg == "long" {
-		closeSide = "sell" // закрываем лонг продажей
-	} else {
-		closeSide = "buy" // закрываем шорт покупкой
+	result := &RollbackResult{
+		Success: false,
 	}
 
-	// Формируем ноги для закрытия
-	legs := []models.Leg{
-		{
-			Exchange: exchange,
-			Side:     leg,
-			Quantity: qty,
-		},
+	// Формируем единственную ногу для закрытия
+	// Side указывает направление ПОЗИЦИИ (long/short), не действия
+	legToClose := models.Leg{
+		Exchange: exchange,
+		Side:     leg,
+		Quantity: qty,
 	}
 
-	// Закрываем через OrderExecutor
+	// Закрываем через OrderExecutor с агрессивным таймаутом
 	closeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	closeResult := h.orderExec.CloseParallel(closeCtx, CloseParams{
 		Symbol: symbol,
-		Legs:   append(legs, models.Leg{Exchange: exchange, Side: closeSide, Quantity: qty}),
+		Legs:   []models.Leg{legToClose},
 	})
 
-	// Для одной ноги используем прямое закрытие
-	_ = closeResult // используем для проверки
+	// КРИТИЧНО: проверяем результат закрытия!
+	if closeResult == nil {
+		result.Error = fmt.Errorf("rollback failed: CloseParallel returned nil")
+		return result
+	}
 
-	result.Success = true // Предполагаем успех (упрощённо)
-	result.PnlLoss = 0    // Slippage потери
+	if !closeResult.Success {
+		result.Error = fmt.Errorf("rollback failed: %v", closeResult.Error)
+		return result
+	}
+
+	result.Success = true
+
+	// Рассчитываем убыток от slippage если есть данные
+	if closeResult.LongOrder != nil && closeResult.LongOrder.AvgFillPrice > 0 {
+		// TODO: добавить расчёт PnL при наличии entry price
+		result.PnlLoss = 0
+	}
 
 	return result
 }
@@ -737,7 +761,10 @@ func (ac *ArbitrageCoordinator) SetFailHandler(fh *SecondLegFailHandler) {
 // - false если условия не выполнены или произошла ошибка
 func (ac *ArbitrageCoordinator) TryEnter(ctx context.Context, ps *PairState) (bool, *ExecuteResult, error) {
 	// Проверяем условия входа
-	currentArbs := atomic.LoadInt64(ac.activeArbs)
+	var currentArbs int64
+	if ac.activeArbs != nil {
+		currentArbs = atomic.LoadInt64(ac.activeArbs)
+	}
 	conditions := ac.detector.CheckEntryConditions(ps, currentArbs, ac.maxArbitrages, ac.validator)
 
 	if !conditions.CanEnter {
