@@ -56,30 +56,20 @@ func NewSettingsHandler(settingsService service.SettingsServiceInterface) *Setti
 //
 //	{"error": "failed to get settings", "details": "..."}
 func (h *SettingsHandler) GetSettings(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	// Проверяем, что сервис инициализирован
 	if h.settingsService == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "settings service not initialized",
-		})
+		h.respondWithError(w, http.StatusInternalServerError, "settings service not initialized", "")
 		return
 	}
 
 	// Получаем настройки через сервис
 	settings, err := h.settingsService.GetSettings()
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":   "failed to get settings",
-			"details": err.Error(),
-		})
+		h.respondWithError(w, http.StatusInternalServerError, "failed to get settings", err.Error())
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(settings)
+	h.respondWithJSON(w, http.StatusOK, settings)
 }
 
 // UpdateSettingsRequest представляет тело запроса на обновление настроек.
@@ -144,25 +134,19 @@ type NotificationPrefsUpdate struct {
 //
 //	{"error": "failed to update settings", "details": "..."}
 func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
 	// Проверяем, что сервис инициализирован
 	if h.settingsService == nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error": "settings service not initialized",
-		})
+		h.respondWithError(w, http.StatusInternalServerError, "settings service not initialized", "")
 		return
 	}
+
+	// Ограничиваем размер тела запроса для защиты от DoS
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
 
 	// Декодируем тело запроса
 	var req UpdateSettingsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":   "invalid request body",
-			"details": err.Error(),
-		})
+		h.respondWithError(w, http.StatusBadRequest, "invalid request body", err.Error())
 		return
 	}
 
@@ -171,22 +155,14 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 		req.MaxConcurrentTrades == nil &&
 		req.NotificationPrefs == nil &&
 		(req.ClearMaxConcurrentTrades == nil || !*req.ClearMaxConcurrentTrades) {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":   "no fields to update",
-			"details": "at least one field must be provided",
-		})
+		h.respondWithError(w, http.StatusBadRequest, "no fields to update", "at least one field must be provided")
 		return
 	}
 
 	// Получаем текущие настройки для частичного обновления notification_prefs
 	currentSettings, err := h.settingsService.GetSettings()
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":   "failed to get current settings",
-			"details": err.Error(),
-		})
+		h.respondWithError(w, http.StatusInternalServerError, "failed to get current settings", err.Error())
 		return
 	}
 
@@ -239,22 +215,29 @@ func (h *SettingsHandler) UpdateSettings(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		// Проверяем тип ошибки для правильного HTTP кода
 		if errors.Is(err, service.ErrInvalidMaxConcurrentTrades) {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(map[string]string{
-				"error":   "validation error",
-				"details": err.Error(),
-			})
+			h.respondWithError(w, http.StatusBadRequest, "validation error", err.Error())
 			return
 		}
 
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{
-			"error":   "failed to update settings",
-			"details": err.Error(),
-		})
+		h.respondWithError(w, http.StatusInternalServerError, "failed to update settings", err.Error())
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(updatedSettings)
+	h.respondWithJSON(w, http.StatusOK, updatedSettings)
+}
+
+// respondWithJSON отправляет JSON ответ
+func (h *SettingsHandler) respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// respondWithError отправляет JSON ответ с ошибкой
+func (h *SettingsHandler) respondWithError(w http.ResponseWriter, code int, message, details string) {
+	response := ErrorResponse{Error: message}
+	if details != "" {
+		response.Details = details
+	}
+	h.respondWithJSON(w, code, response)
 }
