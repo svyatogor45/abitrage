@@ -161,6 +161,17 @@ var BufferOverflows = promauto.NewCounterVec(
 	[]string{"buffer"}, // price_shard, notification, position
 )
 
+// BufferBacklogRatio - заполненность буферов (0..1)
+var BufferBacklogRatio = promauto.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "arbitrage",
+		Subsystem: "trading",
+		Name:      "buffer_backlog_ratio",
+		Help:      "Channel backlog ratio (len/cap) per buffer",
+	},
+	[]string{"buffer"}, // price_shard, notification, position
+)
+
 // GoroutineCount - количество горутин
 var GoroutineCount = promauto.NewGauge(
 	prometheus.GaugeOpts{
@@ -253,6 +264,15 @@ func RecordTrade(symbol, result string, pnl float64) {
 // RecordBufferOverflow записывает переполнение буфера
 func RecordBufferOverflow(bufferName string) {
 	BufferOverflows.WithLabelValues(bufferName).Inc()
+}
+
+// RecordBufferBacklog записывает заполненность буфера (0..1)
+func RecordBufferBacklog(bufferName string, capacity, depth int) {
+	if capacity == 0 {
+		return
+	}
+
+	BufferBacklogRatio.WithLabelValues(bufferName).Set(float64(depth) / float64(capacity))
 }
 
 // UpdateActiveArbitrages обновляет счётчик активных арбитражей

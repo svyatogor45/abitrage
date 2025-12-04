@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -230,8 +231,8 @@ func TestSpreadCalculatorSetFee(t *testing.T) {
 	pt := NewPriceTracker(4)
 	sc := NewSpreadCalculator(pt)
 
-	sc.SetFee("bybit", 0.0004)  // 0.04%
-	sc.SetFee("okx", 0.0005)    // 0.05%
+	sc.SetFee("bybit", 0.0004) // 0.04%
+	sc.SetFee("okx", 0.0005)   // 0.05%
 
 	// Проверяем через внутреннее состояние (fees map)
 	sc.feesMu.RLock()
@@ -342,7 +343,7 @@ func TestSpreadCalculatorNegativeSpread(t *testing.T) {
 	pt.Update(PriceUpdate{
 		Exchange:  "okx",
 		Symbol:    "DOTUSDT",
-		BidPrice:  9.0,  // Bid ниже чем Ask bybit
+		BidPrice:  9.0, // Bid ниже чем Ask bybit
 		AskPrice:  10.5,
 		Timestamp: now,
 	})
@@ -424,8 +425,8 @@ func TestSpreadCalculatorCalculatePnl(t *testing.T) {
 	pnl := sc.CalculatePnl(
 		"AVAXUSDT",
 		"bybit", 34.0, // лонг вход
-		"okx", 36.0,   // шорт вход
-		10.0,          // объём
+		"okx", 36.0, // шорт вход
+		10.0, // объём
 	)
 
 	// PNL лонга = (35.0 - 34.0) * 10 = 10.0
@@ -598,9 +599,9 @@ func TestOrderBookAnalyzerSimulateBuy(t *testing.T) {
 
 	// Стакан Asks: покупаем по Ask
 	asks := []PriceLevel{
-		{Price: 100.0, Volume: 1.0},  // level 0
-		{Price: 100.5, Volume: 2.0},  // level 1
-		{Price: 101.0, Volume: 3.0},  // level 2
+		{Price: 100.0, Volume: 1.0}, // level 0
+		{Price: 100.5, Volume: 2.0}, // level 1
+		{Price: 101.0, Volume: 3.0}, // level 2
 	}
 	bids := []PriceLevel{{Price: 99.0, Volume: 1.0}}
 
@@ -643,9 +644,9 @@ func TestOrderBookAnalyzerSimulateSell(t *testing.T) {
 
 	// Стакан Bids: продаём по Bid
 	bids := []PriceLevel{
-		{Price: 100.0, Volume: 2.0},  // level 0 (лучший)
-		{Price: 99.5, Volume: 3.0},   // level 1
-		{Price: 99.0, Volume: 5.0},   // level 2
+		{Price: 100.0, Volume: 2.0}, // level 0 (лучший)
+		{Price: 99.5, Volume: 3.0},  // level 1
+		{Price: 99.0, Volume: 5.0},  // level 2
 	}
 	asks := []PriceLevel{{Price: 101.0, Volume: 1.0}}
 
@@ -788,6 +789,46 @@ func TestOrderBookAnalyzerAnalyzeLiquidityInsufficient(t *testing.T) {
 
 	if len(analysis.Warnings) == 0 {
 		t.Error("expected warnings about insufficient liquidity")
+	}
+}
+
+func TestPriceTrackerUsesOrderBookAnalyzerForVWAP(t *testing.T) {
+	pt := NewPriceTracker(1)
+	oba := NewOrderBookAnalyzer(5, 5*time.Second)
+	pt.AttachOrderBookAnalyzer(oba, func(symbol string) float64 { return 1 })
+
+	symbol := "BTCUSDT"
+
+	// Обновляем стаканы: лонг на EXA, шорт на EXB
+	oba.UpdateOrderBook(symbol, "EXA",
+		[]PriceLevel{{Price: 99.5, Volume: 5}},
+		[]PriceLevel{{Price: 100, Volume: 0.5}, {Price: 101, Volume: 0.5}},
+	)
+	oba.UpdateOrderBook(symbol, "EXB",
+		[]PriceLevel{{Price: 103, Volume: 0.7}, {Price: 102.5, Volume: 1}},
+		[]PriceLevel{{Price: 104, Volume: 2}},
+	)
+
+	// Базовые лучшие цены из ценовых апдейтов
+	pt.Update(PriceUpdate{Symbol: symbol, Exchange: "EXA", BidPrice: 99.5, AskPrice: 100, Timestamp: time.Now()})
+	pt.Update(PriceUpdate{Symbol: symbol, Exchange: "EXB", BidPrice: 103, AskPrice: 104, Timestamp: time.Now()})
+
+	best := pt.GetBestPrices(symbol)
+	if best == nil {
+		t.Fatalf("expected best prices, got nil")
+	}
+
+	if math.Abs(best.BestAsk-100.5) > 0.0001 {
+		t.Fatalf("expected VWAP-adjusted ask 100.5, got %.4f", best.BestAsk)
+	}
+
+	if math.Abs(best.BestBid-102.85) > 0.0001 {
+		t.Fatalf("expected VWAP-adjusted bid 102.85, got %.4f", best.BestBid)
+	}
+
+	expectedSpread := (102.85 - 100.5) / 100.5 * 100
+	if math.Abs(best.RawSpread-expectedSpread) > 0.0001 {
+		t.Fatalf("expected adjusted spread %.6f, got %.6f", expectedSpread, best.RawSpread)
 	}
 }
 

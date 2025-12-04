@@ -84,6 +84,12 @@ func fnvHash(s string) uint32 {
 type PriceTracker struct {
 	shards    []*PriceShard
 	numShards uint32
+
+	// Опциональный анализатор стаканов для корректировки лучших цен по VWAP
+	orderBookAnalyzer *OrderBookAnalyzer
+
+	// Функция для получения требуемого объёма по символу (для VWAP)
+	volumeLookup func(symbol string) float64
 }
 
 // PriceShard - один шард с собственным мьютексом
@@ -159,6 +165,13 @@ func NewPriceTracker(numShards int) *PriceTracker {
 	return pt
 }
 
+// AttachOrderBookAnalyzer подключает анализатор стаканов и функцию получения объёма
+// Используется для корректировки лучших цен с учётом VWAP/ликвидности без блокировок горячего пути
+func (pt *PriceTracker) AttachOrderBookAnalyzer(analyzer *OrderBookAnalyzer, volumeLookup func(symbol string) float64) {
+	pt.orderBookAnalyzer = analyzer
+	pt.volumeLookup = volumeLookup
+}
+
 // getShard возвращает шард для символа (детерминированно)
 // ОПТИМИЗАЦИЯ: inline FNV-1a без аллокаций (было fnv.New32a() + []byte conversion)
 func (pt *PriceTracker) getShard(symbol string) *PriceShard {
@@ -182,7 +195,6 @@ func (pt *PriceTracker) Update(update PriceUpdate) {
 	shard := pt.getShard(update.Symbol)
 
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 
 	key := PriceKey{
 		Symbol:   update.Symbol,
@@ -207,8 +219,10 @@ func (pt *PriceTracker) Update(update PriceUpdate) {
 		}
 	}
 
-	// Пересчитываем лучшие цены для этого символа
-	shard.recalculateBest(update.Symbol)
+	bestSnapshot := shard.recalculateBest(update.Symbol)
+	shard.mu.Unlock()
+
+	pt.applyLiquidity(bestSnapshot)
 }
 
 // UpdateFromPtr обновляет цену от указателя (для использования с sync.Pool)
@@ -220,7 +234,6 @@ func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
 	shard := pt.getShard(update.Symbol)
 
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 
 	key := PriceKey{
 		Symbol:   update.Symbol,
@@ -245,8 +258,10 @@ func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
 		}
 	}
 
-	// Пересчитываем лучшие цены для этого символа
-	shard.recalculateBest(update.Symbol)
+	bestSnapshot := shard.recalculateBest(update.Symbol)
+	shard.mu.Unlock()
+
+	pt.applyLiquidity(bestSnapshot)
 }
 
 // recalculateBest пересчитывает лучшие Ask и Bid для символа
@@ -255,10 +270,10 @@ func (pt *PriceTracker) UpdateFromPtr(update *PriceUpdate) {
 //
 // ОПТИМИЗАЦИЯ: in-place обновление существующего BestPrices объекта
 // когда это возможно (экономит ~1000+ аллокаций/сек)
-func (shard *PriceShard) recalculateBest(symbol string) {
+func (shard *PriceShard) recalculateBest(symbol string) *BestPrices {
 	keys := shard.symbolIndex[symbol]
 	if len(keys) == 0 {
-		return
+		return nil
 	}
 
 	var bestAsk float64 = 0
@@ -292,6 +307,7 @@ func (shard *PriceShard) recalculateBest(symbol string) {
 	}
 
 	// Сохраняем лучшие цены
+	var bestCopy *BestPrices
 	if bestAsk > 0 && bestBid > 0 {
 		rawSpread := (bestBid - bestAsk) / bestAsk * 100
 
@@ -307,6 +323,7 @@ func (shard *PriceShard) recalculateBest(symbol string) {
 			existing.BestBidExch = bestBidExch
 			existing.BestBidTime = bestBidTime
 			existing.RawSpread = rawSpread
+			bestCopy = &BestPrices{*existing}
 		} else {
 			// Первый раз - создаём новый объект
 			shard.bestPrices[symbol] = &BestPrices{
@@ -319,8 +336,54 @@ func (shard *PriceShard) recalculateBest(symbol string) {
 				BestBidTime: bestBidTime,
 				RawSpread:   rawSpread,
 			}
+			bestCopy = shard.bestPrices[symbol]
 		}
 	}
+
+	if bestCopy != nil {
+		copy := *bestCopy
+		return &copy
+	}
+
+	return nil
+}
+
+// applyLiquidity корректирует лучшие цены с учётом VWAP из кэша стаканов (OrderBookAnalyzer)
+// Тяжёлая часть (AnalyzeLiquidity) выполняется ВНЕ shard lock, чтобы не увеличивать hot path
+func (pt *PriceTracker) applyLiquidity(best *BestPrices) {
+	if best == nil || pt.orderBookAnalyzer == nil {
+		return
+	}
+
+	if best.RawSpread <= 0 || best.BestAskExch == "" || best.BestBidExch == "" {
+		return
+	}
+
+	volume := 0.0
+	if pt.volumeLookup != nil {
+		volume = pt.volumeLookup(best.Symbol)
+	}
+
+	if volume <= 0 {
+		return
+	}
+
+	analysis := pt.orderBookAnalyzer.AnalyzeLiquidity(best.Symbol, volume, best.BestAskExch, best.BestBidExch)
+	if analysis == nil || !analysis.IsLiquidityOK {
+		return
+	}
+
+	shard := pt.getShard(best.Symbol)
+	shard.mu.Lock()
+	if existing := shard.bestPrices[best.Symbol]; existing != nil {
+		existing.BestAsk = analysis.LongSimulation.AvgPrice
+		existing.BestBid = analysis.ShortSimulation.AvgPrice
+		existing.RawSpread = analysis.AdjustedSpread
+		// Сохраняем timestamps исходных лучших цен, чтобы не искажать порядок событий
+		existing.BestAskTime = best.BestAskTime
+		existing.BestBidTime = best.BestBidTime
+	}
+	shard.mu.Unlock()
 }
 
 // GetBestPrices возвращает КОПИЮ лучших цен для символа

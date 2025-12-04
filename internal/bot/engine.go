@@ -306,8 +306,8 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 		priceShards:      make([]*priceShard, numShards),
 		numShards:        numShards,
 		workersPerShard:  workersPerShard,
-		positionUpdates:  make(chan PositionUpdate, 1000),
-		notificationChan: make(chan *models.Notification, 100),
+		positionUpdates:  make(chan PositionUpdate, 2000),
+		notificationChan: make(chan *models.Notification, 2000),
 		shutdown:         make(chan struct{}),
 		wsHub:            wsHub,
 	}
@@ -335,6 +335,9 @@ func NewEngine(cfg *config.Config, wsHub WebSocketHub) *Engine {
 	// Инициализация анализатора стаканов (5 уровней, 5 секунд актуальности)
 	e.orderBookAnalyzer = NewOrderBookAnalyzer(5, 5*time.Second)
 	e.spreadCalc.AttachOrderBookAnalyzer(e.orderBookAnalyzer, 0)
+	e.priceTracker.AttachOrderBookAnalyzer(e.orderBookAnalyzer, func(symbol string) float64 {
+		return e.spreadCalc.getVolumeForSymbol(symbol)
+	})
 
 	balanceFetcher := func(ctx context.Context, exchangeName string) (float64, error) {
 		e.exchMu.RLock()
@@ -460,7 +463,35 @@ func (e *Engine) notificationWorker(ctx context.Context) {
 			if e.wsHub != nil {
 				e.wsHub.BroadcastNotification(notif)
 			}
+			releaseNotification(notif)
 		}
+	}
+}
+
+// enqueueNotification добавляет уведомление в буфер с защитой от переполнения
+func (e *Engine) enqueueNotification(notif *models.Notification) {
+	if notif == nil {
+		return
+	}
+
+	select {
+	case e.notificationChan <- notif:
+		return
+	default:
+		RecordBufferOverflow("notification")
+		RecordBufferBacklog("notification", cap(e.notificationChan), len(e.notificationChan))
+		releaseNotification(notif)
+	}
+}
+
+// enqueuePositionUpdate добавляет обновление позиции, не блокируя отправителя
+func (e *Engine) enqueuePositionUpdate(update PositionUpdate) {
+	select {
+	case e.positionUpdates <- update:
+		return
+	default:
+		RecordBufferOverflow("position")
+		RecordBufferBacklog("position", cap(e.positionUpdates), len(e.positionUpdates))
 	}
 }
 
@@ -631,10 +662,7 @@ func (e *Engine) notifyTradeClosed(ps *PairState, result *ExecuteResult, reason 
 		},
 	}
 
-	select {
-	case e.notificationChan <- notif:
-	default:
-	}
+	e.enqueueNotification(notif)
 }
 
 // priceEventWorker - воркер для обработки ценовых событий одного шарда
@@ -675,6 +703,7 @@ func (e *Engine) routePriceUpdate(exchName, symbol string, bidPrice, askPrice fl
 		releasePriceUpdate(update)
 		// МЕТРИКА: записываем переполнение буфера
 		RecordBufferOverflow("price_shard")
+		RecordBufferBacklog("price_shard", cap(e.priceShards[shardIdx].updates), len(e.priceShards[shardIdx].updates))
 	}
 }
 
@@ -1132,11 +1161,7 @@ func (e *Engine) notifyLiquidation(ps *PairState, liquidatedPos PositionUpdate) 
 	notif.Meta["liquidated_exchange"] = liquidatedPos.Exchange
 	notif.Meta["liquidated_side"] = liquidatedPos.Side
 
-	select {
-	case e.notificationChan <- notif:
-	default:
-		releaseNotification(notif)
-	}
+	e.enqueueNotification(notif)
 }
 
 // notifyLiquidationError отправляет уведомление об ошибке при ликвидации
@@ -1151,11 +1176,7 @@ func (e *Engine) notifyLiquidationError(ps *PairState, err error) {
 	notif.Meta["symbol"] = ps.Config.Symbol
 	notif.Meta["error"] = err.Error()
 
-	select {
-	case e.notificationChan <- notif:
-	default:
-		releaseNotification(notif)
-	}
+	e.enqueueNotification(notif)
 }
 
 // periodicTasks - периодические задачи (НЕ влияют на торговлю)
@@ -1383,11 +1404,7 @@ func (e *Engine) notifyTradeOpened(ps *PairState, result *ExecuteResult) {
 		},
 	}
 
-	select {
-	case e.notificationChan <- notif:
-	default:
-		// Канал заполнен, пропускаем
-	}
+	e.enqueueNotification(notif)
 }
 
 func (e *Engine) notifyError(ps *PairState, err error) {
@@ -1408,10 +1425,7 @@ func (e *Engine) notifyError(ps *PairState, err error) {
 		},
 	}
 
-	select {
-	case e.notificationChan <- notif:
-	default:
-	}
+	e.enqueueNotification(notif)
 }
 
 // ============ API для добавления бирж и пар ============
@@ -1434,13 +1448,13 @@ func (e *Engine) AddExchange(name string, exch exchange.Exchange) {
 func (e *Engine) subscribeToExchange(name string, exch exchange.Exchange) {
 	// Подписка на позиции (для ликвидаций)
 	exch.SubscribePositions(func(pos *exchange.Position) {
-		e.positionUpdates <- PositionUpdate{
+		e.enqueuePositionUpdate(PositionUpdate{
 			Exchange:      name,
 			Symbol:        pos.Symbol,
 			Side:          pos.Side,
 			Liquidated:    pos.Liquidation,
 			UnrealizedPnl: pos.UnrealizedPnl,
-		}
+		})
 	})
 }
 
