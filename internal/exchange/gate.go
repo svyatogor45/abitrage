@@ -32,6 +32,7 @@ type Gate struct {
 
 	// WebSocket manager с автоматическим переподключением
 	wsManager *WSReconnectManager
+	wsMu      sync.Mutex // защита инициализации WebSocket manager
 
 	tickerCallbacks  map[string]func(*Ticker)
 	positionCallback func(*Position)
@@ -63,6 +64,15 @@ func (g *Gate) sign(method, url, queryString, body string, timestamp int64) stri
 	h := hmac.New(sha512.New, []byte(g.secretKey))
 	h.Write([]byte(signStr))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// parseFloat парсит строку в float64 с логированием ошибок
+func (g *Gate) parseFloat(value, field string) float64 {
+	result, err := strconv.ParseFloat(value, 64)
+	if err != nil && value != "" {
+		log.Printf("[gate] failed to parse %s %q: %v", field, value, err)
+	}
+	return result
 }
 
 func (g *Gate) doRequest(ctx context.Context, method, endpoint string, params map[string]string, signed bool) ([]byte, error) {
@@ -166,7 +176,7 @@ func (g *Gate) GetBalance(ctx context.Context) (float64, error) {
 		return 0, err
 	}
 
-	total, _ := strconv.ParseFloat(resp.Total, 64)
+	total := g.parseFloat(resp.Total, "accountTotal")
 	return total, nil
 }
 
@@ -198,9 +208,9 @@ func (g *Gate) GetTicker(ctx context.Context, symbol string) (*Ticker, error) {
 	}
 
 	t := resp[0]
-	bidPrice, _ := strconv.ParseFloat(t.HighestBid, 64)
-	askPrice, _ := strconv.ParseFloat(t.LowestAsk, 64)
-	lastPrice, _ := strconv.ParseFloat(t.Last, 64)
+	bidPrice := g.parseFloat(t.HighestBid, "highestBid")
+	askPrice := g.parseFloat(t.LowestAsk, "lowestAsk")
+	lastPrice := g.parseFloat(t.Last, "last")
 
 	return &Ticker{
 		Symbol:    symbol,
@@ -251,12 +261,12 @@ func (g *Gate) GetOrderBook(ctx context.Context, symbol string, depth int) (*Ord
 	}
 
 	for i, bid := range resp.Bids {
-		price, _ := strconv.ParseFloat(bid.P, 64)
+		price := g.parseFloat(bid.P, "bid.price")
 		orderBook.Bids[i] = PriceLevel{Price: price, Volume: float64(bid.S)}
 	}
 
 	for i, ask := range resp.Asks {
-		price, _ := strconv.ParseFloat(ask.P, 64)
+		price := g.parseFloat(ask.P, "ask.price")
 		orderBook.Asks[i] = PriceLevel{Price: price, Volume: float64(ask.S)}
 	}
 
@@ -303,7 +313,7 @@ func (g *Gate) PlaceMarketOrder(ctx context.Context, symbol, side string, qty fl
 		return nil, err
 	}
 
-	fillPrice, _ := strconv.ParseFloat(resp.FillPrice, 64)
+	fillPrice := g.parseFloat(resp.FillPrice, "fillPrice")
 	filledSize := qty - float64(resp.Left)
 	if filledSize < 0 {
 		filledSize = -filledSize
@@ -350,9 +360,9 @@ func (g *Gate) GetOpenPositions(ctx context.Context) ([]*Position, error) {
 			continue
 		}
 
-		entryPrice, _ := strconv.ParseFloat(p.EntryPrice, 64)
-		markPrice, _ := strconv.ParseFloat(p.MarkPrice, 64)
-		unrealizedPnl, _ := strconv.ParseFloat(p.UnrealisedPnl, 64)
+		entryPrice := g.parseFloat(p.EntryPrice, "position.entryPrice")
+		markPrice := g.parseFloat(p.MarkPrice, "position.markPrice")
+		unrealizedPnl := g.parseFloat(p.UnrealisedPnl, "position.unrealisedPnl")
 
 		side := SideLong
 		size := float64(p.Size)
@@ -401,6 +411,8 @@ func (g *Gate) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 	g.tickerCallbacks[symbol] = callback
 	g.callbackMu.Unlock()
 
+	// Защита от race condition при инициализации WebSocket manager
+	g.wsMu.Lock()
 	if g.wsManager == nil {
 		config := DefaultWSReconnectConfig()
 		g.wsManager = NewWSReconnectManager("gate", gateWSURL, config)
@@ -416,9 +428,12 @@ func (g *Gate) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		})
 
 		if err := g.wsManager.Connect(); err != nil {
+			g.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := g.wsManager
+	g.wsMu.Unlock()
 
 	contract := g.toGateSymbol(symbol)
 	subMsg := map[string]interface{}{
@@ -428,8 +443,8 @@ func (g *Gate) SubscribeTicker(symbol string, callback func(*Ticker)) error {
 		"payload": []string{contract},
 	}
 
-	g.wsManager.AddSubscription(subMsg)
-	return g.wsManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 // handleMessage обрабатывает одно сообщение из WebSocket
@@ -458,9 +473,9 @@ func (g *Gate) handleMessage(message []byte) {
 			g.callbackMu.RUnlock()
 
 			if ok && callback != nil {
-				bidPrice, _ := strconv.ParseFloat(t.HighestBid, 64)
-				askPrice, _ := strconv.ParseFloat(t.LowestAsk, 64)
-				lastPrice, _ := strconv.ParseFloat(t.Last, 64)
+				bidPrice := g.parseFloat(t.HighestBid, "ws.ticker.highestBid")
+				askPrice := g.parseFloat(t.LowestAsk, "ws.ticker.lowestAsk")
+				lastPrice := g.parseFloat(t.Last, "ws.ticker.last")
 
 				callback(&Ticker{
 					Symbol:    symbol,
@@ -479,6 +494,8 @@ func (g *Gate) SubscribePositions(callback func(*Position)) error {
 	g.positionCallback = callback
 	g.callbackMu.Unlock()
 
+	// Защита от race condition при инициализации WebSocket manager
+	g.wsMu.Lock()
 	if g.wsManager == nil {
 		config := DefaultWSReconnectConfig()
 		g.wsManager = NewWSReconnectManager("gate", gateWSURL, config)
@@ -494,9 +511,12 @@ func (g *Gate) SubscribePositions(callback func(*Position)) error {
 		})
 
 		if err := g.wsManager.Connect(); err != nil {
+			g.wsMu.Unlock()
 			return fmt.Errorf("failed to connect to WebSocket: %w", err)
 		}
 	}
+	wsManager := g.wsManager
+	g.wsMu.Unlock()
 
 	subMsg := map[string]interface{}{
 		"time":    time.Now().Unix(),
@@ -510,8 +530,8 @@ func (g *Gate) SubscribePositions(callback func(*Position)) error {
 		},
 	}
 
-	g.wsManager.AddSubscription(subMsg)
-	return g.wsManager.Send(subMsg)
+	wsManager.AddSubscription(subMsg)
+	return wsManager.Send(subMsg)
 }
 
 func (g *Gate) authenticateWebSocket(conn *websocket.Conn) error {
@@ -557,7 +577,7 @@ func (g *Gate) GetLimits(ctx context.Context, symbol string) (*Limits, error) {
 		return nil, err
 	}
 
-	quantoMultiplier, _ := strconv.ParseFloat(resp.QuantoMultiplier, 64)
+	quantoMultiplier := g.parseFloat(resp.QuantoMultiplier, "limits.quantoMultiplier")
 
 	return &Limits{
 		Symbol:      symbol,
