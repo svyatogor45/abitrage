@@ -120,12 +120,21 @@ func (e *ExchangeError) Error() string {
 	return e.Exchange + ": " + e.Message
 }
 
-// Side constants
+// Unwrap возвращает оригинальную ошибку для поддержки errors.Is() и errors.As()
+func (e *ExchangeError) Unwrap() error {
+	return e.Original
+}
+
+// Side constants for orders (используются при размещении ордеров)
 const (
-	SideBuy  = "buy"
-	SideSell = "sell"
-	SideLong  = "long"
-	SideShort = "short"
+	SideBuy  = "buy"  // покупка (открытие long или закрытие short)
+	SideSell = "sell" // продажа (открытие short или закрытие long)
+)
+
+// Side constants for positions (используются для описания направления позиции)
+const (
+	SideLong  = "long"  // длинная позиция (ставка на рост)
+	SideShort = "short" // короткая позиция (ставка на падение)
 )
 
 // Order status constants
